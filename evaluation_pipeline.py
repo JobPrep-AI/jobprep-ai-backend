@@ -304,6 +304,29 @@ def evaluate_interview(company, role, qa_pairs):
 
 
 # -------------------------------
+# HINT GENERATION
+# -------------------------------
+def generate_hint(question, level):
+    instructions = {
+        1: "Give only a vague directional hint. Do NOT name any algorithm or data structure. Just point the candidate in the right direction.",
+        2: "Name the specific algorithm or data structure needed. Do NOT show any code or pseudocode.",
+        3: "Provide a clear step-by-step pseudocode approach. Do NOT write actual runnable code.",
+    }
+    prompt = f"""
+You are a technical interviewer giving a structured hint to a candidate who is stuck.
+
+Question:
+{question}
+
+Hint Level {level}/3 instruction:
+{instructions.get(level, instructions[1])}
+
+Return ONLY the hint text. No preamble. No label. No extra explanation.
+"""
+    return llm(prompt)
+
+
+# -------------------------------
 # LEARNING PATH
 # -------------------------------
 def generate_learning_path(results, role, company, job_description="", jd_requirements=None):

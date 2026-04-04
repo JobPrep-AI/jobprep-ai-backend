@@ -623,14 +623,19 @@ STRICT RULES:
 
 --------------------------------------------------
 
-CODING QUESTIONS (3):
+CODING QUESTIONS (3) — ORDERED BY DIFFICULTY:
+
+Question 1 MUST be EASY   — arrays, strings, basic hashing
+Question 2 MUST be MEDIUM — trees, graphs, sliding window, binary search
+Question 3 MUST be HARD   — dynamic programming, advanced graphs, complex optimization
 
 Each MUST include:
 - title
+- difficulty  ("Easy", "Medium", or "Hard")
 - problem_statement (FULL detailed problem)
 - example_input_output
 - constraints
-- test_cases
+- test_cases (list of {{"input": "...", "expected_output": "..."}} objects)
 
 DO NOT leave any field empty.
 
@@ -684,10 +689,11 @@ Follow the EXACT structure below:
   "coding_questions": [
     {{
       "title": "",
+      "difficulty": "Easy",
       "problem_statement": "",
       "example_input_output": "",
       "constraints": "",
-      "test_cases": []
+      "test_cases": [{{"input": "", "expected_output": ""}}]
     }}
   ],
   "system_design": {{
