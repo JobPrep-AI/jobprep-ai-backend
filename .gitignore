@@ -1,0 +1,21 @@
+.env
+*.env
+
+# Secrets / keys
+rsa_key.p8
+rsa_key.pub
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Editor / IDE
+.vscode/
+
+# Local SQLTools session
+Snow.session.sql
+
+# Generated graph artifacts
+graphrag_html.html
+jobprep_knowledge_graph.html
+lib/
