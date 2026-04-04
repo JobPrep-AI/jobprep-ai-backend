@@ -32,7 +32,6 @@ def fetch_pandas_df(query, params=None):
         else:
             cur.execute(query)
         df = cur.fetch_pandas_all()
-        # Snowflake often returns uppercase column names; normalize once.
         df.columns = [str(c).lower() for c in df.columns]
         return df
     finally:
@@ -47,8 +46,18 @@ def clean_llm_output(text):
     elif text is None:
         return ""
 
-    text = str(text)
+    text = str(text).strip()
+
+    if text.startswith('"') and text.endswith('"'):
+        try:
+            unquoted = json.loads(text)
+            if isinstance(unquoted, str):
+                text = unquoted.strip()
+        except Exception:
+            pass
+
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+
     return text.strip()
 
 
@@ -86,7 +95,7 @@ def get_query_embedding(text):
 def load_summary_df():
     query = """
     SELECT cluster_id, summary, embedding
-    FROM JOBPREP_DB.DBT_JOBPREP_DBT_JOBPREP_MARTS.CLUSTER_SUMMARIES
+    FROM JOBPREP_DB.MARTS.CLUSTER_SUMMARIES
     ORDER BY cluster_id
     """
     df = fetch_pandas_df(query)
@@ -103,6 +112,7 @@ def load_summary_df():
 
     df["embedding"] = df["embedding"].apply(normalize_embedding)
     return df
+
 
 def _is_real_question(q: str) -> bool:
     signals = ["?", "how ", "what ", "why ", "design ", "explain ",
@@ -128,7 +138,9 @@ def expand_questions(questions, company, role):
         prompt = f"""You are a technical interviewer at {company} for a {role} role.
 Convert this LeetCode problem title into a full interview-style question.
 Title: {q}
-Return JSON only: {{"title": "", "problem_statement": "", "example": "", "constraints": ""}}
+Return ONLY JSON.
+No explanation.
+No markdown: {{"title": "", "problem_statement": "", "example": "", "constraints": ""}}
 No markdown, no explanation."""
         raw = llm(prompt, model="llama3.3-70b")
         parsed = parse_json_response(raw)
@@ -140,10 +152,11 @@ No markdown, no explanation."""
         enriched.append(result)
     return enriched
 
+
 def load_cluster_questions():
     query = """
     SELECT cluster_id, interview_question
-    FROM JOBPREP_DB.DBT_JOBPREP_DBT_JOBPREP_MARTS.CLUSTER_QUESTIONS
+    FROM JOBPREP_DB.MARTS.CLUSTER_QUESTIONS
     ORDER BY cluster_id
     """
     df = fetch_pandas_df(query)
@@ -154,25 +167,52 @@ def load_cluster_questions():
 
     return dict(cluster_questions)
 
+
 def parse_json_response(text):
-    text = clean_llm_output(text)
+    if not isinstance(text, str):
+        return None
+
+    text = text.strip()
+
+    text = re.sub(r"```json", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"```", "", text)
+
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if start != -1 and end != -1 and end > start:
+        text = text[start:end + 1]
 
     try:
         parsed = json.loads(text)
+
         if isinstance(parsed, str):
             parsed = json.loads(parsed)
-        return parsed
-    except json.JSONDecodeError:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            try:
-                parsed = json.loads(text[start:end+1])
-                if isinstance(parsed, str):
-                    parsed = json.loads(parsed)
-                return parsed
-            except json.JSONDecodeError:
-                return None
+
+        if isinstance(parsed, dict):
+            return parsed
+
+    except:
+        pass
+
+    repair_prompt = f"""
+Fix this into VALID JSON.
+
+Return ONLY JSON.
+No explanation.
+
+Input:
+{text}
+"""
+    repaired = llm(repair_prompt, model="llama3.3-70b")
+
+    try:
+        parsed = json.loads(repaired)
+        if isinstance(parsed, dict):
+            return parsed
+    except:
+        pass
+
     return None
 
 
@@ -253,7 +293,6 @@ def fallback_requirements_from_jd(job_description):
     systems = [label for kw, label in system_map if kw in lower][:6]
     behavioral = [label for kw, label in behavioral_map if kw in lower][:6]
 
-    # Pull likely "must-have" lines as priorities.
     lines = [ln.strip(" -\t") for ln in text.splitlines() if ln.strip()]
     priority = []
     trigger_words = ("must", "required", "requirement", "experience with", "proficiency", "strong")
@@ -274,6 +313,8 @@ def fallback_requirements_from_jd(job_description):
 
 def extract_jd_requirements(company, role, job_description):
     prompt = f"""
+You MUST return ONLY raw JSON.
+No explanation.
 Extract the most important interview-relevant requirements from this job description.
 
 Company: {company}
@@ -366,6 +407,7 @@ def simplify_requirements(jd_requirements):
 
     return simplified
 
+
 def build_requirement_query(company, role, jd_requirements):
     jd_requirements = normalize_jd_requirements(jd_requirements)
     tech = ", ".join(jd_requirements.get("technical_skills", []))
@@ -440,7 +482,6 @@ def retrieve_top_clusters(company, role, jd_requirements, summary_df, top_k=5):
     return ranked.sort_values("final_score", ascending=False).head(top_k)
 
 
-
 def _extract_json_object(text):
     start = text.find("{")
     end = text.rfind("}")
@@ -484,6 +525,7 @@ def parse_interview_json(interview_text):
 
     return None
 
+
 def detect_missing_requirements(jd_requirements, selected_questions, top_clusters=None):
     simplified = simplify_requirements(jd_requirements)
 
@@ -512,13 +554,11 @@ def detect_missing_requirements(jd_requirements, selected_questions, top_cluster
     return _unique_keep_order(missing)
 
 
-
 def coerce_interview_json(interview_text):
     parsed = parse_interview_json(interview_text)
     if isinstance(parsed, dict):
         return parsed
 
-    # Fallback: ask a stable model to convert noisy output into strict JSON.
     repair_prompt = f"""
 Convert the following interview content into valid JSON with EXACT keys:
 - coding_questions (list of 3 items)
@@ -550,6 +590,13 @@ def generate_mock_interview(company, role, job_description, selected_questions, 
     missing = ", ".join(missing_requirements)
 
     prompt = f"""
+You MUST return ONLY raw JSON.
+Do NOT include:
+- explanations
+- extra text
+- markdown
+- code blocks
+
 You are acting as a real interviewer from {company} for the role of {role}.
 
 Job Description:
@@ -629,7 +676,9 @@ Retrieved questions:
 
 --------------------------------------------------
 
-Return ONLY valid JSON in this EXACT format:
+Return ONLY valid JSON.
+No explanation. No extra text.
+Follow the EXACT structure below:
 
 {{
   "coding_questions": [
@@ -699,12 +748,10 @@ def collect_relevant_questions(top_clusters, jobs_df, cluster_questions, company
 
         return "other"
 
-    # ONLY DSA
     for cid in top_clusters["cluster_id"]:
         for q in cluster_questions.get(cid, []):
             cat = q_to_cat.get(q, "")
             bucket = category_bucket(cat)
-
             if q in exact_questions and q not in selected_questions:
                 if bucket == "coding":
                     selected_questions.append(q)
@@ -713,7 +760,6 @@ def collect_relevant_questions(top_clusters, jobs_df, cluster_questions, company
         for q in cluster_questions.get(cid, []):
             cat = q_to_cat.get(q, "")
             bucket = category_bucket(cat)
-
             if q in role_questions and q not in selected_questions:
                 if bucket == "coding":
                     selected_questions.append(q)
@@ -722,20 +768,20 @@ def collect_relevant_questions(top_clusters, jobs_df, cluster_questions, company
         for q in cluster_questions.get(cid, []):
             cat = q_to_cat.get(q, "")
             bucket = category_bucket(cat)
-
             if q not in selected_questions and bucket == "coding":
                 selected_questions.append(q)
-
             if len(selected_questions) >= max_questions:
                 return selected_questions[:max_questions]
 
     return selected_questions[:max_questions]
 
 
-
+# -------------------------------
+# MODULE-LEVEL DATA LOAD
+# -------------------------------
 query_jobs = """
 SELECT *
-FROM JOBPREP_DB.DBT_JOBPREP_DBT_JOBPREP_MARTS.MART_QUESTION_BANK
+FROM JOBPREP_DB.MARTS.MART_QUESTION_BANK
 """
 
 jobs_df = fetch_pandas_df(query_jobs)

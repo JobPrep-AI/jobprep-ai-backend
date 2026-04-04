@@ -39,7 +39,7 @@ print("Loading interview questions...")
 
 query_jobs = """
 SELECT *
-FROM JOBPREP_DB.DBT_JOBPREP_DBT_JOBPREP_MARTS.MART_QUESTION_BANK
+FROM JOBPREP_DB.MARTS.MART_QUESTION_BANK
 """
 
 jobs_df = fetch_pandas_df(query_jobs)
@@ -80,7 +80,6 @@ for _, row in jobs_df.iterrows():
     G.add_edge(role, question, relation="asks")
     G.add_edge(question, category, relation="belongs_to")
 
-    # Optional richer graph if columns exist
     if "DIFFICULTY_LEVEL" in jobs_df.columns:
         difficulty = row["DIFFICULTY_LEVEL"]
         if pd.notna(difficulty):
@@ -171,16 +170,16 @@ print("Saving summaries to Snowflake...")
 cur = conn.cursor()
 
 cur.execute("""
-TRUNCATE TABLE JOBPREP_DB.DBT_JOBPREP_DBT_JOBPREP_MARTS.CLUSTER_SUMMARIES
+TRUNCATE TABLE JOBPREP_DB.MARTS.CLUSTER_SUMMARIES
 """)
 
 cur.execute("""
-TRUNCATE TABLE JOBPREP_DB.DBT_JOBPREP_DBT_JOBPREP_MARTS.CLUSTER_QUESTIONS
+TRUNCATE TABLE JOBPREP_DB.MARTS.CLUSTER_QUESTIONS
 """)
 
 
 insert_summary_sql = """
-INSERT INTO JOBPREP_DB.DBT_JOBPREP_DBT_JOBPREP_MARTS.CLUSTER_SUMMARIES
+INSERT INTO JOBPREP_DB.MARTS.CLUSTER_SUMMARIES
 (cluster_id, summary)
 VALUES (%s, %s)
 """
@@ -192,7 +191,7 @@ print(f"Inserted {len(summary_rows)} rows into CLUSTER_SUMMARIES")
 
 
 insert_question_sql = """
-INSERT INTO JOBPREP_DB.DBT_JOBPREP_DBT_JOBPREP_MARTS.CLUSTER_QUESTIONS
+INSERT INTO JOBPREP_DB.MARTS.CLUSTER_QUESTIONS
 (cluster_id, interview_question)
 VALUES (%s, %s)
 """
@@ -213,7 +212,7 @@ conn.commit()
 print("Generating embeddings in Snowflake...")
 
 cur.execute("""
-UPDATE JOBPREP_DB.DBT_JOBPREP_DBT_JOBPREP_MARTS.CLUSTER_SUMMARIES
+UPDATE JOBPREP_DB.MARTS.CLUSTER_SUMMARIES
 SET embedding = SNOWFLAKE.CORTEX.EMBED_TEXT_768(
     'snowflake-arctic-embed-m-v1.5',
     summary

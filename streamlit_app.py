@@ -1,3 +1,4 @@
+import json
 import streamlit as st
 from graphrag_pipeline import coerce_interview_json, run_graphrag_interview
 from evaluation_pipeline import evaluate_interview, generate_learning_path
@@ -24,10 +25,7 @@ if "user_answers" not in st.session_state:
 # -------------------------------
 def is_valid_dsa(q):
     text = q.lower()
-
-    # only STRICT unwanted types
     bad = ["sql query", "database query", "table", "join"]
-
     return not any(b in text for b in bad)
 
 # -------------------------------
@@ -39,7 +37,6 @@ if st.button("Generate Mock Interview"):
     else:
         with st.spinner("Generating..."):
             result = run_graphrag_interview(company, role, job_description)
-
         st.session_state.interview_data = result
         st.session_state.user_answers = []
 
@@ -48,18 +45,13 @@ if st.button("Generate Mock Interview"):
 # -------------------------------
 if st.session_state.interview_data:
 
-    _, _, interview, _, _ = st.session_state.interview_data
+    _, _, interview, jd_requirements, _ = st.session_state.interview_data
 
     parsed = coerce_interview_json(interview)
 
     if not isinstance(parsed, dict):
         st.error("Invalid interview format. Please regenerate.")
         st.stop()
-
-    # 🔥 DEBUG START (ADD HERE)
-    raw_questions = parsed.get("coding_questions", [])
-
-    st.write("🔍 Total coding questions:", len(raw_questions))
 
     # -------------------------------
     # CODING QUESTIONS
@@ -69,15 +61,10 @@ if st.session_state.interview_data:
     user_answers = []
 
     raw_questions = parsed.get("coding_questions", [])
-
     filtered_questions = [
         q for q in raw_questions
         if is_valid_dsa(q.get("problem_statement", ""))
     ]
-
-    st.write("🔍 After filtering:", len(filtered_questions))
-
-    # 🔥 fallback if empty
     coding_questions = filtered_questions if filtered_questions else raw_questions
 
     for i, q in enumerate(coding_questions, start=1):
@@ -85,25 +72,21 @@ if st.session_state.interview_data:
 
             st.markdown("### Problem")
             problem_text = q.get("problem_statement") or q.get("title") or "No question text available"
-
             st.write(problem_text)
 
             st.markdown("### Example")
             example = q.get("example_input_output")
-
             if example:
                 st.code(example)
             else:
                 st.info("No example provided")
 
-            # LANGUAGE
             lang = st.selectbox(
                 f"Language Q{i}",
                 ["python", "java", "cpp"],
                 key=f"lang_{i}"
             )
 
-            # CODE INPUT
             code = st.text_area(
                 f"Write Code Q{i}",
                 height=300,
@@ -115,12 +98,10 @@ if st.session_state.interview_data:
                 key=f"stdin_{i}"
             )
 
-            # RUN CODE
             if st.button(f"Run Code Q{i}"):
                 result = run_code(code, lang, stdin)
 
                 st.markdown(f"### Output (via **{result.get('source')}**)")
-
                 output = result.get("stdout")
 
                 if output and output.strip():
@@ -145,30 +126,30 @@ if st.session_state.interview_data:
     st.markdown("## System Design")
 
     sd = parsed.get("system_design", {})
+    sd_title = sd.get("title", "No title")
+    st.markdown(f"### {sd_title}")
 
-    st.markdown(f"### {sd.get('title', 'No title')}")
-
-    # ✅ USE CASE
     st.markdown("**Use Case**")
     st.write(sd.get("use_case", "Not provided"))
 
-    # ✅ FUNCTIONAL REQUIREMENTS
     st.markdown("**Functional Requirements**")
     for item in sd.get("functional_requirements", []):
         st.write(f"- {item}")
 
-    # ✅ NON-FUNCTIONAL REQUIREMENTS
     st.markdown("**Non-Functional Requirements**")
     for item in sd.get("non_functional_requirements", []):
         st.write(f"- {item}")
 
-    # ✅ DISCUSSION POINTS
     st.markdown("**Key Discussion Points**")
     for item in sd.get("key_discussion_points", []):
         st.write(f"- {item}")
 
-    # ANSWER BOX
-    sd_answer = st.text_area("Your System Design Answer")
+    sd_answer = st.text_area("Your System Design Answer", key="sd_answer")
+
+    user_answers.append({
+        "question": f"Design a {sd_title}",
+        "answer": sd_answer or ""
+    })
 
     # -------------------------------
     # BEHAVIORAL
@@ -178,7 +159,7 @@ if st.session_state.interview_data:
     behavioral_q = parsed.get("behavioral", {}).get("question", "")
     st.write(behavioral_q)
 
-    beh_answer = st.text_area("Your Behavioral Answer")
+    beh_answer = st.text_area("Your Behavioral Answer", key="beh_answer")
 
     user_answers.append({
         "question": behavioral_q,
@@ -205,20 +186,41 @@ if st.session_state.interview_data:
         for i, r in enumerate(results, start=1):
             with st.expander(f"Feedback Q{i}"):
 
-                scores = r.get("evaluation", {}).get("scores", {})
-                st.json(scores)
+                evaluation = r.get("evaluation", {})
+                scores = evaluation.get("scores", {})
+                is_optimized = evaluation.get("is_optimized", False)
+                q_type = evaluation.get("question_type", "coding")
 
-                st.markdown("### Strengths")
-                for s in r.get("evaluation", {}).get("strengths", []):
-                    st.write("✅", s)
+                # Score metrics — dynamic column count based on number of metrics
+                cols = st.columns(len(scores))
+                for col, (k, v) in zip(cols, scores.items()):
+                    col.metric(k.replace("_", " ").capitalize(), f"{v}/10")
 
-                st.markdown("### Weaknesses")
-                for w in r.get("evaluation", {}).get("weaknesses", []):
-                    st.write("⚠️", w)
+                st.markdown("---")
 
-                st.markdown("### Missing Concepts")
-                for m in r.get("evaluation", {}).get("missing_concepts", []):
-                    st.write("❌", m)
+                if is_optimized:
+                    st.success("✅ Optimized solution — great answer, no suggestions needed.")
+                else:
+                    strengths = evaluation.get("strengths", [])
+                    weaknesses = evaluation.get("weaknesses", [])
+                    optimized_approach = evaluation.get("optimized_approach", "")
+
+                    if strengths:
+                        st.markdown("### Strengths")
+                        for s in strengths:
+                            st.write("✅", s)
+
+                    if weaknesses:
+                        st.markdown("### Weaknesses")
+                        for w in weaknesses:
+                            st.write("⚠️", w)
+
+                    if optimized_approach:
+                        st.markdown("### Optimized Approach")
+                        st.info(optimized_approach)
+
+                    if not strengths and not weaknesses and not optimized_approach:
+                        st.info("No detailed feedback available.")
 
         # -------------------------------
         # LEARNING PLAN
@@ -226,9 +228,18 @@ if st.session_state.interview_data:
         st.markdown("## Personalized Learning Plan")
 
         plan = generate_learning_path(
-            results,
-            role,
-            company
+            results, role, company,
+            job_description=job_description,
+            jd_requirements=jd_requirements
         )
 
-        st.write(plan)
+        if isinstance(plan, str):
+            plan = plan.strip()
+            if plan.startswith('"') and plan.endswith('"'):
+                try:
+                    plan = json.loads(plan)
+                except Exception:
+                    pass
+            plan = plan.replace("\\n", "\n")
+
+        st.markdown(plan)

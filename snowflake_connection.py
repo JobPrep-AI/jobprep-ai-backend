@@ -10,7 +10,7 @@ def get_snowflake_connection(
     account: str = "pgb87192",
     warehouse: str = "COMPUTE_WH",
     database: str = "JOBPREP_DB",
-    schema: str = "RAW_DATA",
+    schema: str = "MARTS",
     private_key_path: str = "rsa_key.p8",
 ):
     key_path = Path(private_key_path)
