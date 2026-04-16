@@ -6,15 +6,19 @@ from sklearn.metrics.pairwise import cosine_similarity
 import re
 import json
 import sys
+import streamlit as st
 from pathlib import Path
+import time
+import random
+import logging
+
+logger = logging.getLogger(__name__)
 
 project_root = Path(r"C:\Users\yslog\OneDrive\Desktop\GenAI Project\jobprep-ai-backend")
 if str(project_root) not in sys.path:
     sys.path.append(str(project_root))
 
-from snowflake_connection import get_snowflake_connection
-
-conn = get_snowflake_connection()
+from snowflake_utils import llm, get_embedding, fetch_df, clean_llm_output
 
 DEFAULT_JD_REQUIREMENTS = {
     "technical_skills": [],
@@ -23,82 +27,14 @@ DEFAULT_JD_REQUIREMENTS = {
     "priority_requirements": [],
 }
 
-
-def fetch_pandas_df(query, params=None):
-    cur = conn.cursor()
-    try:
-        if params:
-            cur.execute(query, params)
-        else:
-            cur.execute(query)
-        df = cur.fetch_pandas_all()
-        df.columns = [str(c).lower() for c in df.columns]
-        return df
-    finally:
-        cur.close()
-
-
-def clean_llm_output(text):
-    if isinstance(text, list):
-        text = "\n".join(map(str, text))
-    elif isinstance(text, dict):
-        text = json.dumps(text, ensure_ascii=False)
-    elif text is None:
-        return ""
-
-    text = str(text).strip()
-
-    if text.startswith('"') and text.endswith('"'):
-        try:
-            unquoted = json.loads(text)
-            if isinstance(unquoted, str):
-                text = unquoted.strip()
-        except Exception:
-            pass
-
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
-
-    return text.strip()
-
-
-def llm(prompt, model="llama3.3-70b"):
-    query = f"""
-    SELECT SNOWFLAKE.CORTEX.AI_COMPLETE(
-        '{model}',
-        $$ {prompt} $$
-    ) AS RESPONSE
-    """
-
-    result = fetch_pandas_df(query)
-    raw_text = result.iloc[0]["response"]
-    return clean_llm_output(raw_text)
-
-
-def get_query_embedding(text):
-    query = """
-    SELECT SNOWFLAKE.CORTEX.EMBED_TEXT_768(
-        'snowflake-arctic-embed-m-v1.5',
-        %s
-    ) AS EMB
-    """
-
-    cur = conn.cursor()
-    try:
-        cur.execute(query, (text,))
-        result = cur.fetchone()[0]
-    finally:
-        cur.close()
-
-    return np.array(result, dtype=float)
-
-
+@st.cache_data
 def load_summary_df():
     query = """
     SELECT cluster_id, summary, embedding
     FROM JOBPREP_DB.MARTS.CLUSTER_SUMMARIES
     ORDER BY cluster_id
     """
-    df = fetch_pandas_df(query)
+    df = fetch_df(query)
     if "embedding" not in df.columns:
         raise ValueError(
             "Missing 'embedding' column in CLUSTER_SUMMARIES. "
@@ -152,14 +88,14 @@ No markdown, no explanation."""
         enriched.append(result)
     return enriched
 
-
+@st.cache_data
 def load_cluster_questions():
     query = """
     SELECT cluster_id, interview_question
     FROM JOBPREP_DB.MARTS.CLUSTER_QUESTIONS
     ORDER BY cluster_id
     """
-    df = fetch_pandas_df(query)
+    df = fetch_df(query)
 
     cluster_questions = defaultdict(list)
     for row in df.itertuples(index=False):
@@ -168,12 +104,11 @@ def load_cluster_questions():
     return dict(cluster_questions)
 
 
-def parse_json_response(text):
+def parse_json_response(text, _repair_attempt=False):
     if not isinstance(text, str):
         return None
 
     text = text.strip()
-
     text = re.sub(r"```json", "", text, flags=re.IGNORECASE)
     text = re.sub(r"```", "", text)
 
@@ -185,15 +120,19 @@ def parse_json_response(text):
 
     try:
         parsed = json.loads(text)
-
         if isinstance(parsed, str):
             parsed = json.loads(parsed)
-
         if isinstance(parsed, dict):
             return parsed
-
     except:
         pass
+
+    # Only attempt LLM repair once — never repair a repair
+    if _repair_attempt:
+        logger.warning("parse_json_response: repair attempt also failed, giving up.")
+        return None
+
+    logger.warning("parse_json_response: standard parse failed, attempting LLM repair...")
 
     repair_prompt = f"""
 Fix this into VALID JSON.
@@ -213,7 +152,8 @@ Input:
     except:
         pass
 
-    return None
+    # Parse the repaired text but flag it as already repaired
+    return parse_json_response(repaired, _repair_attempt=True)
 
 
 def normalize_jd_requirements(value):
@@ -252,40 +192,23 @@ def fallback_requirements_from_jd(job_description):
     lower = text.lower()
 
     tech_map = [
-        ("python", "Python"),
-        ("java", "Java"),
-        ("c++", "C++"),
-        ("sql", "SQL"),
-        ("snowflake", "Snowflake"),
-        ("spark", "Apache Spark"),
-        ("airflow", "Airflow"),
-        ("dbt", "dbt"),
-        ("pandas", "Pandas"),
-        ("aws", "AWS"),
-        ("azure", "Azure"),
-        ("gcp", "GCP"),
-        ("docker", "Docker"),
-        ("kubernetes", "Kubernetes"),
+        ("python", "Python"), ("java", "Java"), ("c++", "C++"),
+        ("sql", "SQL"), ("snowflake", "Snowflake"), ("spark", "Apache Spark"),
+        ("airflow", "Airflow"), ("dbt", "dbt"), ("pandas", "Pandas"),
+        ("aws", "AWS"), ("azure", "Azure"), ("gcp", "GCP"),
+        ("docker", "Docker"), ("kubernetes", "Kubernetes"),
     ]
     system_map = [
-        ("distributed", "Distributed systems"),
-        ("microservice", "Microservices"),
-        ("scalable", "Scalable backend design"),
-        ("system design", "System design"),
-        ("api", "API design"),
-        ("event", "Event-driven architecture"),
-        ("queue", "Message queues"),
-        ("cache", "Caching"),
-        ("database", "Database design"),
-        ("pipeline", "Data pipelines"),
+        ("distributed", "Distributed systems"), ("microservice", "Microservices"),
+        ("scalable", "Scalable backend design"), ("system design", "System design"),
+        ("api", "API design"), ("event", "Event-driven architecture"),
+        ("queue", "Message queues"), ("cache", "Caching"),
+        ("database", "Database design"), ("pipeline", "Data pipelines"),
     ]
     behavioral_map = [
-        ("collaborat", "Cross-team collaboration"),
-        ("communicat", "Communication"),
-        ("ownership", "Ownership"),
-        ("lead", "Leadership"),
-        ("mentor", "Mentoring"),
-        ("stakeholder", "Stakeholder management"),
+        ("collaborat", "Cross-team collaboration"), ("communicat", "Communication"),
+        ("ownership", "Ownership"), ("lead", "Leadership"),
+        ("mentor", "Mentoring"), ("stakeholder", "Stakeholder management"),
         ("problem solving", "Problem solving"),
     ]
 
@@ -374,10 +297,7 @@ def simplify_requirements(jd_requirements):
     keyword_map = {
         "data structures and algorithms": ["data structures", "algorithms"],
         "object-oriented programming": ["oop", "object-oriented programming"],
-        "java": ["java"],
-        "python": ["python"],
-        "c++": ["c++"],
-        "go": ["go"],
+        "java": ["java"], "python": ["python"], "c++": ["c++"], "go": ["go"],
         "distributed systems": ["distributed systems"],
         "microservices": ["microservices"],
         "scalable backend design": ["backend", "scalable backend"],
@@ -393,16 +313,13 @@ def simplify_requirements(jd_requirements):
         expanded = []
         for item in values:
             lower_item = item.lower()
-
             matched = False
             for phrase, mapped_terms in keyword_map.items():
                 if phrase in lower_item:
                     expanded.extend(mapped_terms)
                     matched = True
-
             if not matched:
                 expanded.append(item)
-
         simplified[key] = _unique_keep_order(expanded)
 
     return simplified
@@ -442,7 +359,7 @@ def retrieve_top_clusters(company, role, jd_requirements, summary_df, top_k=5):
     jd_requirements = normalize_jd_requirements(jd_requirements)
     user_query = build_requirement_query(company, role, jd_requirements)
 
-    query_embedding = get_query_embedding(user_query)
+    query_embedding = get_embedding(user_query)
 
     cluster_embeddings = np.vstack(summary_df["embedding"].values)
     scores = cosine_similarity([query_embedding], cluster_embeddings)[0]
@@ -456,24 +373,19 @@ def retrieve_top_clusters(company, role, jd_requirements, summary_df, top_k=5):
     def boost(summary):
         s = str(summary).lower()
         val = 0.0
-
         if role_lower in s:
             val += 0.05
         if company_lower in s:
             val += 0.03
-
         for term in jd_requirements.get("technical_skills", []):
             if term.lower() in s:
                 val += 0.02
-
         for term in jd_requirements.get("system_topics", []):
             if term.lower() in s:
                 val += 0.02
-
         for term in jd_requirements.get("behavioral_traits", []):
             if term.lower() in s:
                 val += 0.02
-
         return val
 
     ranked["boost"] = ranked["summary"].apply(boost)
@@ -528,7 +440,6 @@ def parse_interview_json(interview_text):
 
 def detect_missing_requirements(jd_requirements, selected_questions, top_clusters=None):
     simplified = simplify_requirements(jd_requirements)
-
     selected_text = " ".join(selected_questions).lower()
 
     cluster_text = ""
@@ -536,18 +447,14 @@ def detect_missing_requirements(jd_requirements, selected_questions, top_cluster
         cluster_text = " ".join(top_clusters["summary"].astype(str).tolist()).lower()
 
     combined_text = f"{selected_text} {cluster_text}"
-
     missing = []
-
     ignore_terms = {"python", "java", "c++", "go"}
 
     for group in ["technical_skills", "system_topics", "behavioral_traits", "priority_requirements"]:
         for req in simplified.get(group, []):
             req_lower = req.lower().strip()
-
             if req_lower in ignore_terms:
                 continue
-
             if req_lower not in combined_text:
                 missing.append(req)
 
@@ -581,6 +488,7 @@ Input:
 
 def generate_mock_interview(company, role, job_description, selected_questions, jd_requirements, missing_requirements):
     jd_requirements = normalize_jd_requirements(jd_requirements)
+    variety_seed = int(time.time()) % 1000
     text = "\n".join(selected_questions)
 
     tech = ", ".join(jd_requirements.get("technical_skills", []))
@@ -604,6 +512,10 @@ Job Description:
 
 --------------------------------------------------
 
+Variety seed (use this to ensure unique questions): {variety_seed}
+Generate questions that are DIFFERENT from typical interview questions.
+Pick uncommon but valid DSA problems.
+
 STRICT RULES:
 
 1. Coding questions MUST ONLY be Data Structures & Algorithms:
@@ -621,6 +533,10 @@ STRICT RULES:
    - 1 system design question
    - 1 behavioral question
 
+5. Test cases must have VERIFIED correct expected outputs.
+   Trace through your own algorithm manually before writing expected_output.
+   A wrong expected_output is worse than no test case.
+
 --------------------------------------------------
 
 CODING QUESTIONS (3) — ORDERED BY DIFFICULTY:
@@ -636,6 +552,71 @@ Each MUST include:
 - example_input_output
 - constraints
 - test_cases (list of {{"input": "...", "expected_output": "..."}} objects)
+- starter_code with python, java, and cpp keys
+
+STARTER CODE RULES:
+- Function name must match the problem
+- Parameter types must be correct for each language
+- Input reading must match the test case input format exactly
+- Do NOT implement the solution — body is pass or return default only
+- Java class must always be named Solution
+- CPP must always include bits/stdc++.h
+- Python must handle input parsing and print the result
+
+VARIETY RULE:
+- Do NOT reuse questions from previous interviews
+- Each interview must have completely different problem titles and scenarios
+- For Easy: choose a different array/string pattern each time
+- For Medium: rotate between trees, graphs, sliding window, binary search
+- For Hard: rotate between DP, advanced graphs, complex optimization
+- The behavioral question must be different each time
+- The system design must use a different real-world system each time
+
+PYTHON starter_code template:
+import json
+
+def solve(param):
+    # Write your solution here
+    pass
+
+# Input handling
+try:
+    data = input().strip()
+    print(solve(data))
+except:
+    pass
+
+JAVA starter_code template:
+import java.util.*;
+
+public class Solution {{
+    public static ReturnType solve(ParamType param) {{
+        // Write your solution here
+        return defaultValue;
+    }}
+
+    public static void main(String[] args) {{
+        Scanner sc = new Scanner(System.in);
+        String input = sc.nextLine().trim();
+        System.out.println(solve(input));
+    }}
+}}
+
+CPP starter_code template:
+#include <bits/stdc++.h>
+using namespace std;
+
+ReturnType solve(ParamType param) {{
+    // Write your solution here
+    return defaultValue;
+}}
+
+int main() {{
+    string input;
+    getline(cin, input);
+    cout << solve(input) << endl;
+    return 0;
+}}
 
 DO NOT leave any field empty.
 
@@ -653,11 +634,6 @@ You MUST return FULL structure:
   "key_discussion_points": []
 }}
 
-⚠️ IMPORTANT:
-- NOT just "Design X"
-- Must include explanation
-- Should be realistic (e.g., URL shortener, chat system, notification system)
-
 --------------------------------------------------
 
 BEHAVIORAL (1):
@@ -668,12 +644,6 @@ You MUST return:
   "question": ""
 }}
 
-⚠️ IMPORTANT:
-- Must be a real HR-style question
-- Example:
-  "Tell me about a time you handled conflict in a team"
-  "Describe a challenging project and how you solved it"
-
 --------------------------------------------------
 
 Retrieved questions:
@@ -681,9 +651,7 @@ Retrieved questions:
 
 --------------------------------------------------
 
-Return ONLY valid JSON.
-No explanation. No extra text.
-Follow the EXACT structure below:
+Return ONLY valid JSON. No explanation. No extra text.
 
 {{
   "coding_questions": [
@@ -693,7 +661,12 @@ Follow the EXACT structure below:
       "problem_statement": "",
       "example_input_output": "",
       "constraints": "",
-      "test_cases": [{{"input": "", "expected_output": ""}}]
+      "test_cases": [{{"input": "", "expected_output": ""}}],
+      "starter_code": {{
+        "python": "",
+        "java": "",
+        "cpp": ""
+      }}
     }}
   ],
   "system_design": {{
@@ -735,23 +708,16 @@ def collect_relevant_questions(top_clusters, jobs_df, cluster_questions, company
 
     def category_bucket(cat):
         c = (cat or "").lower()
-
         if any(x in c for x in ["system", "backend", "distributed", "design", "architecture"]):
             return "system"
-
         if any(x in c for x in ["behavioral", "general", "leadership", "hr"]):
             return "behavioral"
-
         if any(x in c for x in ["sql", "database", "db", "query"]):
             return "sql"
-
-        if any(x in c for x in [
-            "array", "string", "graph", "tree", "dp",
-            "algorithm", "recursion", "linked", "stack",
-            "queue", "search", "sort"
-        ]):
+        if any(x in c for x in ["array", "string", "graph", "tree", "dp",
+                                  "algorithm", "recursion", "linked", "stack",
+                                  "queue", "search", "sort"]):
             return "coding"
-
         return "other"
 
     for cid in top_clusters["cluster_id"]:
@@ -771,11 +737,14 @@ def collect_relevant_questions(top_clusters, jobs_df, cluster_questions, company
                     selected_questions.append(q)
 
     for cid in top_clusters["cluster_id"]:
-        for q in cluster_questions.get(cid, []):
-            cat = q_to_cat.get(q, "")
-            bucket = category_bucket(cat)
-            if q not in selected_questions and bucket == "coding":
-                selected_questions.append(q)
+        pool = [
+            q for q in cluster_questions.get(cid, [])
+            if q not in selected_questions
+            and category_bucket(q_to_cat.get(q, "")) == "coding"
+        ]
+        random.shuffle(pool)
+        for q in pool:
+            selected_questions.append(q)
             if len(selected_questions) >= max_questions:
                 return selected_questions[:max_questions]
 
@@ -785,24 +754,26 @@ def collect_relevant_questions(top_clusters, jobs_df, cluster_questions, company
 # -------------------------------
 # MODULE-LEVEL DATA LOAD
 # -------------------------------
-query_jobs = """
-SELECT *
-FROM JOBPREP_DB.MARTS.MART_QUESTION_BANK
-"""
+@st.cache_data
+def load_jobs_df():
+    df = fetch_df("""
+    SELECT *
+    FROM JOBPREP_DB.MARTS.MART_QUESTION_BANK
+    """)
+    df = df.drop_duplicates(
+        subset=["company_name", "role_name", "interview_question"]
+    )
+    df = df.dropna(
+        subset=["company_name", "role_name", "interview_question", "question_category_enhanced"]
+    )
+    return df
 
-jobs_df = fetch_pandas_df(query_jobs)
-jobs_df = jobs_df.drop_duplicates(
-    subset=["company_name", "role_name", "interview_question"]
-)
-jobs_df = jobs_df.dropna(
-    subset=["company_name", "role_name", "interview_question", "question_category_enhanced"]
-)
-
+jobs_df = load_jobs_df()
 summary_df = load_summary_df()
 cluster_questions = load_cluster_questions()
 
 
-def run_graphrag_interview(company, role, job_description, top_k=5):
+def run_graphrag_interview(company, role, job_description, top_k=8):
     jd_requirements = extract_jd_requirements(company, role, job_description)
 
     top_clusters = retrieve_top_clusters(

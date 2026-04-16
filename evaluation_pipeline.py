@@ -1,7 +1,10 @@
 import json
 import re
-from graphrag_pipeline import llm, parse_json_response
+from snowflake_utils import llm
+from graphrag_pipeline import parse_json_response
+import logging
 
+logger = logging.getLogger(__name__)
 
 # -------------------------------
 # SAFE JSON PARSER
@@ -14,6 +17,7 @@ def safe_json_parse(text):
 
 
 def repair_json_with_llm(bad_text):
+    logger.warning("repair_json_with_llm: attempting single LLM repair...")
     repair_prompt = f"""
 Fix this into VALID JSON.
 
@@ -24,7 +28,19 @@ Input:
 {bad_text}
 """
     fixed = llm(repair_prompt)
-    return safe_json_parse(fixed)
+    # Use basic JSON parsing only — no further LLM calls
+    if not isinstance(fixed, str):
+        return {}
+    try:
+        start = fixed.find("{")
+        end = fixed.rfind("}")
+        if start != -1 and end != -1:
+            parsed = json.loads(fixed[start:end + 1])
+            if isinstance(parsed, dict):
+                return parsed
+    except Exception:
+        pass
+    return {}
 
 
 # -------------------------------
@@ -63,27 +79,75 @@ def _detect_question_type(question: str) -> str:
 
     behavioral_signals = [
         "tell me about", "describe a time", "how do you handle",
-        "give an example", "what would you do", "have you ever"
+        "give an example", "what would you do", "have you ever",
+        "walk me through", "share an experience", "how have you",
+        "what is your approach to working", "describe your"
     ]
     system_design_signals = [
-        "design a", "design an", "architect", "how would you build",
-        "how would you design", "scalable", "distributed system",
-        "system for", "design the backend", "url shortener",
-        "chat system", "notification system", "ride sharing",
-        "news feed", "key discussion"
+        "design a system", "design an", "architect a", "architect an",
+        "how would you build a", "how would you design a",
+        "design the backend", "url shortener", "chat system",
+        "notification system", "ride sharing", "news feed",
+        "design twitter", "design uber", "design netflix",
+        "design youtube", "design instagram", "design whatsapp",
+        "key discussion points", "non-functional requirements",
+        "scalability of", "distributed system for"
+    ]
+    coding_signals = [
+        "given an array", "given a string", "given a list",
+        "given a binary tree", "given a linked list",
+        "implement a function", "write a function", "write code",
+        "find the", "return the", "solve the following",
+        "leetcode", "algorithm", "data structure",
+        "time complexity", "space complexity",
+        "two pointers", "sliding window", "dynamic programming",
+        "depth first", "breadth first", "binary search"
     ]
 
-    if any(s in q for s in behavioral_signals):
-        return "behavioral"
-    if any(s in q for s in system_design_signals):
-        return "system_design"
-    return "coding"
+    # Score each type by counting matching signals
+    behavioral_score = sum(1 for s in behavioral_signals if s in q)
+    system_score = sum(1 for s in system_design_signals if s in q)
+    coding_score = sum(1 for s in coding_signals if s in q)
+
+    # Pick the highest scoring type
+    scores = {
+        "behavioral": behavioral_score,
+        "system_design": system_score,
+        "coding": coding_score
+    }
+
+    best = max(scores, key=scores.get)
+
+    # Only classify as non-coding if it has at least 1 clear signal
+    # Otherwise default to coding since that's most common
+    if scores[best] == 0:
+        return "coding"
+
+    return best
 
 
 # -------------------------------
 # PROMPTS BY QUESTION TYPE
 # -------------------------------
-def _coding_prompt(question, user_answer, ideal_data):
+def _coding_prompt(question, user_answer, ideal_data, test_results=None):
+    # Build test execution summary
+    test_summary = ""
+    if test_results:
+        passed = sum(1 for r in test_results if r.get("passed"))
+        total = len(test_results)
+        lines = [f"Test Execution Results: {passed}/{total} passed"]
+        for r in test_results:
+            status = "PASSED" if r.get("passed") else "FAILED"
+            lines.append(
+                f"  - Test {r.get('case')}: Input={r.get('input')} "
+                f"| Expected={r.get('expected')} "
+                f"| Got={r.get('actual')} "
+                f"| {status}"
+            )
+        test_summary = "\n".join(lines)
+    else:
+        test_summary = "Test Execution Results: Not available"
+
     return f"""
 You are an expert technical interviewer evaluating a coding answer.
 
@@ -96,8 +160,15 @@ Candidate Answer:
 Ideal Answer:
 {ideal_data.get('ideal_answer', '')}
 
+ACTUAL TEST EXECUTION RESULTS (trust these over your own analysis):
+{test_summary}
+
 Score each dimension from 0 to 10:
-- correctness: does the solution produce correct output for all cases including edge cases
+- correctness: base this STRICTLY on test execution results above
+  * 3/3 passed = 9-10
+  * 2/3 passed = 6-7
+  * 1/3 passed = 3-4
+  * 0/3 passed = 0-2
 - time_complexity: is the time complexity optimal for this problem
 - space_complexity: is the space complexity optimal
 - code_quality: clean code, meaningful names, handles edge cases
@@ -232,7 +303,7 @@ def _check_optimized(q_type, scores):
 # -------------------------------
 # ANSWER EVALUATION
 # -------------------------------
-def evaluate_answer(question, user_answer, ideal_data):
+def evaluate_answer(question, user_answer, ideal_data, test_results=None):
     if not isinstance(ideal_data, dict):
         ideal_data = {}
 
@@ -243,7 +314,7 @@ def evaluate_answer(question, user_answer, ideal_data):
     elif q_type == "system_design":
         prompt = _system_design_prompt(question, user_answer, ideal_data)
     else:
-        prompt = _coding_prompt(question, user_answer, ideal_data)
+        prompt = _coding_prompt(question, user_answer, ideal_data, test_results)
 
     response = llm(prompt)
     parsed = safe_json_parse(response)
@@ -282,23 +353,100 @@ def evaluate_answer(question, user_answer, ideal_data):
 # INTERVIEW EVALUATION
 # -------------------------------
 def evaluate_interview(company, role, qa_pairs):
-    results = []
+    from code_executor import run_test_cases, reverify_with_user_code
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    for qa in qa_pairs:
-        answer = qa.get("answer", "")
+    # Filter out empty answers first
+    valid_pairs = [
+        qa for qa in qa_pairs
+        if isinstance(qa.get("answer", ""), str) and qa.get("answer", "").strip()
+    ]
 
-        if not isinstance(answer, str) or not answer.strip():
-            continue
+    if not valid_pairs:
+        return []
 
+    def evaluate_single(qa):
+        """Evaluate a single question-answer pair."""
         question = qa.get("question", "")
-        ideal = generate_ideal_answer(question, role, company)
-        evaluation = evaluate_answer(question, answer, ideal)
+        answer = qa.get("answer", "")
+        lang = qa.get("lang", "python")
+        test_cases = qa.get("test_cases", [])
 
-        results.append({
-            "question": question,
-            "evaluation": evaluation,
-            "ideal": ideal
-        })
+        try:
+            ideal = generate_ideal_answer(question, role, company)
+            q_type = _detect_question_type(question)
+
+            # Run code against test cases for coding questions
+            test_results = None
+            if q_type == "coding" and test_cases and answer.strip():
+                try:
+                    corrected = reverify_with_user_code(answer, lang, test_cases)
+                    test_results = run_test_cases(answer, lang, corrected)
+                    passed = sum(1 for r in test_results if r.get("passed"))
+                    logger.info(
+                        f"Test execution for Q: {question[:60]}... "
+                        f"Passed: {passed}/{len(test_results)}"
+                    )
+                except Exception as e:
+                    logger.warning(f"Test execution failed: {e}")
+                    test_results = None
+
+            evaluation = evaluate_answer(question, answer, ideal, test_results)
+
+            return {
+                "question": question,
+                "evaluation": evaluation,
+                "ideal": ideal,
+                "test_results": test_results,
+                "_order": qa.get("_order", 0)
+            }
+
+        except Exception as e:
+            logger.error(f"evaluate_single failed for Q: {question[:60]}... Error: {e}")
+            q_type = _detect_question_type(question)
+            return {
+                "question": question,
+                "evaluation": {
+                    "scores": _default_scores(q_type),
+                    "is_optimized": False,
+                    "strengths": [],
+                    "weaknesses": [f"Evaluation failed: {str(e)}"],
+                    "optimized_approach": "",
+                    "question_type": q_type
+                },
+                "ideal": {},
+                "test_results": None,
+                "_order": qa.get("_order", 0)
+            }
+
+    # Tag each qa with its original order
+    for idx, qa in enumerate(valid_pairs):
+        qa["_order"] = idx
+
+    results = [None] * len(valid_pairs)
+
+    # Run all evaluations in parallel
+    # max_workers=3 to avoid overwhelming Snowflake Cortex
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        future_to_idx = {
+            executor.submit(evaluate_single, qa): qa.get("_order", i)
+            for i, qa in enumerate(valid_pairs)
+        }
+
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                result = future.result()
+                results[result.get("_order", idx)] = result
+            except Exception as e:
+                logger.error(f"Future failed for index {idx}: {e}")
+
+    # Filter out any None results (failed futures)
+    results = [r for r in results if r is not None]
+
+    # Clean up _order key from results
+    for r in results:
+        r.pop("_order", None)
 
     return results
 

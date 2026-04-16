@@ -19,3 +19,5 @@ Snow.session.sql
 graphrag_html.html
 jobprep_knowledge_graph.html
 lib/
+
+.streamlit/secrets.toml
