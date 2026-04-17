@@ -468,8 +468,8 @@ def coerce_interview_json(interview_text):
 
     repair_prompt = f"""
 Convert the following interview content into valid JSON with EXACT keys:
-- coding_questions (list of 3 items)
-- system_design (object)
+- coding_questions (list of 4 items)
+- system_design_questions (list of 2 objects)
 - behavioral (object)
 
 Rules:
@@ -486,10 +486,26 @@ Input:
     return parse_interview_json(repaired)
 
 
-def generate_mock_interview(company, role, job_description, selected_questions, jd_requirements, missing_requirements):
+def generate_mock_interview(company, role, job_description, selected_questions,
+                            jd_requirements, missing_requirements, weak_areas=None):
     jd_requirements = normalize_jd_requirements(jd_requirements)
     variety_seed = int(time.time()) % 1000
     text = "\n".join(selected_questions)
+
+    # Build weak area instruction for personalized question targeting
+    if weak_areas and len(weak_areas) > 0:
+        wa_lines = []
+        slots = ["Q2 Medium", "Q3 Hard", "Q4 Hard"]
+        for i, wa in enumerate(weak_areas[:3]):
+            topic = wa.get("topic", "")
+            score = wa.get("avg_score", 0)
+            slot = slots[i] if i < len(slots) else "Q4 Hard"
+            wa_lines.append(
+                f"- {slot} MUST target '{topic}' — user scored {score}/10 here"
+            )
+        weak_area_instruction = "\n".join(wa_lines)
+    else:
+        weak_area_instruction = "No specific weak areas — generate a balanced interview."
 
     tech = ", ".join(jd_requirements.get("technical_skills", []))
     systems = ", ".join(jd_requirements.get("system_topics", []))
@@ -529,8 +545,8 @@ STRICT RULES:
 3. If retrieved questions are not DSA, ignore them
 
 4. Ensure:
-   - 3 coding questions
-   - 1 system design question
+   - 4 coding questions
+   - 2 system design question
    - 1 behavioral question
 
 5. Test cases must have VERIFIED correct expected outputs.
@@ -539,11 +555,15 @@ STRICT RULES:
 
 --------------------------------------------------
 
-CODING QUESTIONS (3) — ORDERED BY DIFFICULTY:
+CODING QUESTIONS (4) — ORDERED BY DIFFICULTY:
 
 Question 1 MUST be EASY   — arrays, strings, basic hashing
 Question 2 MUST be MEDIUM — trees, graphs, sliding window, binary search
 Question 3 MUST be HARD   — dynamic programming, advanced graphs, complex optimization
+Question 4 MUST be HARD   — different hard topic from Q3, complex optimization
+
+WEAK AREA TARGETING:
+{weak_area_instruction}
 
 Each MUST include:
 - title
@@ -622,17 +642,18 @@ DO NOT leave any field empty.
 
 --------------------------------------------------
 
-SYSTEM DESIGN (1):
+SYSTEM DESIGN (2):
 
-You MUST return FULL structure:
+You MUST return 2 system design questions as a list.
+SD1: A standard system design (URL shortener, notification system, etc.)
+SD2: A more complex distributed system design (ride sharing, news feed, etc.)
 
-{{
-  "title": "",
-  "use_case": "",
-  "functional_requirements": [],
-  "non_functional_requirements": [],
-  "key_discussion_points": []
-}}
+Each MUST have:
+- title
+- use_case
+- functional_requirements
+- non_functional_requirements
+- key_discussion_points
 
 --------------------------------------------------
 
@@ -669,13 +690,15 @@ Return ONLY valid JSON. No explanation. No extra text.
       }}
     }}
   ],
-  "system_design": {{
-    "title": "",
-    "use_case": "",
-    "functional_requirements": [],
-    "non_functional_requirements": [],
-    "key_discussion_points": []
-  }},
+  "system_design_questions": [
+    {{
+      "title": "",
+      "use_case": "",
+      "functional_requirements": [],
+      "non_functional_requirements": [],
+      "key_discussion_points": []
+    }}
+  ],
   "behavioral": {{
     "question": ""
   }}
@@ -772,6 +795,105 @@ jobs_df = load_jobs_df()
 summary_df = load_summary_df()
 cluster_questions = load_cluster_questions()
 
+
+def generate_single_question(topic: str, q_type: str, company: str = "", role: str = "") -> dict:
+    """
+    Generate a single question for Quick Practice mode.
+    q_type: 'coding', 'system_design', or 'behavioral'
+    topic: specific topic like 'Arrays & Strings', 'Dynamic Programming', etc.
+    """
+    variety_seed = int(time.time()) % 1000
+
+    if q_type == "coding":
+        prompt = f"""
+You are a technical interviewer generating a single coding question.
+
+Topic: {topic}
+Company context: {company or "a top tech company"}
+Role context: {role or "Software Engineer"}
+Variety seed: {variety_seed}
+
+Generate ONE coding question on the topic: {topic}
+
+Rules:
+- Must be a pure DSA problem related to {topic}
+- Include a complete problem statement
+- Include example input/output
+- Include constraints
+- Include 3 test cases with verified expected outputs
+- Include starter code for python, java, and cpp
+- Difficulty should be Medium
+
+Return ONLY valid JSON. No explanation. No extra text.
+
+{{
+  "title": "",
+  "difficulty": "Medium",
+  "topic": "{topic}",
+  "problem_statement": "",
+  "example_input_output": "",
+  "constraints": "",
+  "test_cases": [{{"input": "", "expected_output": ""}}],
+  "starter_code": {{
+    "python": "",
+    "java": "",
+    "cpp": ""
+  }}
+}}
+"""
+
+    elif q_type == "system_design":
+        prompt = f"""
+You are a technical interviewer generating a single system design question.
+
+Variety seed: {variety_seed}
+
+Generate ONE realistic system design question.
+
+Rules:
+- Must be a real-world system (e.g. URL shortener, notification system, ride sharing)
+- Include use case, functional requirements, non-functional requirements, key discussion points
+- Must be different each time
+
+Return ONLY valid JSON. No explanation.
+
+{{
+  "title": "",
+  "use_case": "",
+  "functional_requirements": [],
+  "non_functional_requirements": [],
+  "key_discussion_points": []
+}}
+"""
+
+    elif q_type == "behavioral":
+        prompt = f"""
+You are a technical interviewer generating a single behavioral question.
+
+Variety seed: {variety_seed}
+
+Generate ONE behavioral interview question.
+
+Rules:
+- Must be a real HR-style question
+- Must be different each time
+- Examples: "Tell me about a time you handled conflict", "Describe a challenging project"
+
+Return ONLY valid JSON. No explanation.
+
+{{
+  "question": ""
+}}
+"""
+    else:
+        return {}
+
+    response = llm(prompt, model="llama3.3-70b")
+    parsed = parse_json_response(response)
+    if isinstance(parsed, dict):
+        parsed["q_type"] = q_type
+        return parsed
+    return {}
 
 def run_graphrag_interview(company, role, job_description, top_k=8):
     jd_requirements = extract_jd_requirements(company, role, job_description)

@@ -170,8 +170,16 @@ Score each dimension from 0 to 10:
   * 1/3 passed = 3-4
   * 0/3 passed = 0-2
 - time_complexity: is the time complexity optimal for this problem
+  * If correctness = 0 (completely wrong solution): time_complexity MUST be <= 3
+  * If correctness >= 1 but code has inefficiencies: score normally
+  * A completely wrong solution cannot have a valid time complexity
 - space_complexity: is the space complexity optimal
+  * If correctness = 0 (completely wrong solution): space_complexity MUST be <= 3
+  * If correctness >= 1: score normally based on actual space used
 - code_quality: clean code, meaningful names, handles edge cases
+  * If correctness = 0: code_quality MUST be <= 3
+  * If correctness >= 1 but has minor issues: score between 4-7
+  * Only score 8+ if code is both correct AND clean
 
 If correctness >= 8 AND time_complexity >= 7:
 - set is_optimized to true
@@ -475,129 +483,720 @@ Return ONLY the hint text. No preamble. No label. No extra explanation.
 
 
 # -------------------------------
-# LEARNING PATH
+# SKILL GROUP DEFINITIONS
+# OR-skills: demonstrating any one satisfies the requirement
 # -------------------------------
-def generate_learning_path(results, role, company, job_description="", jd_requirements=None):
+LANGUAGE_GROUP = [
+    "java", "python", "c++", "c#", "go", "golang",
+    "javascript", "typescript", "kotlin", "swift", "rust", "scala"
+]
 
-    # --- Collect performance data from evaluation ---
-    weak_areas = []
-    strong_areas = []
-    per_question_summary = []
+CLOUD_GROUP = [
+    "aws", "gcp", "azure", "cloud platforms", "cloud", "google cloud"
+]
 
-    for r in results:
+DB_GROUP = [
+    "mysql", "postgresql", "mongodb", "dynamodb", "redis",
+    "cassandra", "database", "databases", "sql", "nosql"
+]
+
+OR_SKILL_GROUPS = [LANGUAGE_GROUP, CLOUD_GROUP, DB_GROUP]
+
+# Skills implicitly assessed through coding questions
+CODING_IMPLICIT_SKILLS = [
+    "data structures", "algorithms", "problem-solving", "problem solving",
+    "analytical skills", "coding", "programming", "data structure",
+    "algorithm", "computational thinking", "logical reasoning",
+    "software engineering", "computer science fundamentals"
+]
+
+# Skills implicitly assessed through system design questions
+SYSTEM_DESIGN_IMPLICIT_SKILLS = [
+    "system design", "distributed systems", "scalability", "architecture",
+    "backend", "scalable backend", "distributed", "microservices",
+    "high availability", "fault tolerance"
+]
+
+# Skills implicitly assessed through behavioral questions
+BEHAVIORAL_IMPLICIT_SKILLS = [
+    "communication", "teamwork", "collaboration", "leadership",
+    "problem-solving", "adaptability", "analytical skills",
+    "interpersonal skills", "stakeholder management"
+]
+
+# Skills that need explicit demonstration in code — not implicitly covered
+OOP_SKILLS = [
+    "object-oriented programming", "oop", "object oriented",
+    "design patterns", "inheritance", "encapsulation",
+    "polymorphism", "abstraction", "solid principles"
+]
+
+
+def _normalize(text: str) -> str:
+    return text.lower().strip()
+
+
+def _is_or_skill(skill: str) -> bool:
+    """Check if a skill belongs to an OR group."""
+    s = _normalize(skill)
+    for group in OR_SKILL_GROUPS:
+        if any(s in g or g in s for g in group):
+            return True
+    return False
+
+
+def _get_or_group(skill: str) -> list:
+    """Get the OR group a skill belongs to."""
+    s = _normalize(skill)
+    for group in OR_SKILL_GROUPS:
+        if any(s in g or g in s for g in group):
+            return group
+    return []
+
+
+def _detect_not_assessed(
+    jd_requirements: dict,
+    eval_results: list,
+    user_answers: list = None
+) -> list:
+    """
+    Detect JD skills that were never assessed in the interview.
+    Handles OR-skill groups, implicit skill coverage, and OOP detection.
+    """
+    # Check what question types were actually present
+    question_types_assessed = set()
+    for r in eval_results:
+        qt = r.get("evaluation", {}).get("question_type", "")
+        if qt:
+            question_types_assessed.add(qt)
+
+    # Collect all score keys from evaluation
+    assessed_keys = set()
+    for r in eval_results:
+        scores = r.get("evaluation", {}).get("scores", {})
+        for k in scores.keys():
+            assessed_keys.add(_normalize(k.replace("_", " ")))
+
+    # Add languages actually used by the user
+    used_languages = set()
+    if user_answers:
+        for qa in user_answers:
+            lang = qa.get("lang", "")
+            if lang:
+                used_languages.add(_normalize(lang))
+
+    # Check if OOP was actually demonstrated in any code answer
+    oop_demonstrated = False
+    if user_answers:
+        oop_signals = [
+            "class ", "self.", "extends ", "implements ",
+            "public class", "private ", "protected ",
+            "def __init__", "super()", "override",
+            "@override", "abstract", "interface "
+        ]
+        for qa in user_answers:
+            answer = qa.get("answer", "")
+            if any(signal in answer for signal in oop_signals):
+                oop_demonstrated = True
+                break
+
+    # Collect all JD skills
+    all_jd_skills = []
+    for group in ["technical_skills", "system_topics",
+                  "behavioral_traits", "priority_requirements"]:
+        for skill in jd_requirements.get(group, []):
+            all_jd_skills.append(_normalize(skill))
+
+    not_assessed = []
+    satisfied_or_groups = set()
+
+    for skill in all_jd_skills:
+        skill_n = _normalize(skill)
+
+        # OOP — only satisfied if explicitly demonstrated in code
+        if any(oop in skill_n or skill_n in oop
+               for oop in OOP_SKILLS):
+            if not oop_demonstrated:
+                not_assessed.append(skill)
+            continue
+
+        # Implicit coverage via coding questions
+        if "coding" in question_types_assessed or \
+           "system_design" in question_types_assessed:
+            if any(imp in skill_n or skill_n in imp
+                   for imp in CODING_IMPLICIT_SKILLS):
+                continue
+
+        # Implicit coverage via system design questions
+        if "system_design" in question_types_assessed:
+            if any(imp in skill_n or skill_n in imp
+                   for imp in SYSTEM_DESIGN_IMPLICIT_SKILLS):
+                continue
+
+        # Implicit coverage via behavioral questions
+        if "behavioral" in question_types_assessed:
+            if any(imp in skill_n or skill_n in imp
+                   for imp in BEHAVIORAL_IMPLICIT_SKILLS):
+                continue
+
+        # Check if it's an OR skill
+        if _is_or_skill(skill):
+            group = tuple(_get_or_group(skill))
+            if group in satisfied_or_groups:
+                continue
+            group_satisfied = any(
+                any(g in ak or ak in g for ak in assessed_keys)
+                or any(g in ul or ul in g for ul in used_languages)
+                for g in group
+            )
+            if group_satisfied:
+                satisfied_or_groups.add(group)
+            else:
+                not_assessed.append(skill)
+                satisfied_or_groups.add(group)
+        else:
+            # AND skill — check direct match in score keys
+            is_assessed = any(
+                skill_n in ak or ak in skill_n
+                for ak in assessed_keys
+            )
+            if not is_assessed:
+                not_assessed.append(skill)
+
+    return list(set(not_assessed))[:6]
+
+
+def _extract_concepts_per_question(eval_results: list) -> list:
+    """
+    For each coding question, extract the concepts it tests
+    and whether the user demonstrated them correctly.
+    Returns a list of dicts per question with concepts and pass/fail.
+    """
+    question_concepts = []
+
+    for r in eval_results:
         evaluation = r.get("evaluation", {})
         q_type = evaluation.get("question_type", "coding")
 
-        if q_type == "behavioral":
+        # Only process coding questions
+        if q_type != "coding":
             continue
 
-        scores = evaluation.get("scores", {})
-        is_optimized = evaluation.get("is_optimized", False)
-        question = r.get("question", "")[:120]
-
-        low = [k.replace("_", " ") for k, v in scores.items() if v < 7]
-        high = [k.replace("_", " ") for k, v in scores.items() if v >= 8]
+        question = r.get("question", "")
+        correctness = evaluation.get("scores", {}).get("correctness", 0)
         weaknesses = evaluation.get("weaknesses", [])
+        optimized_approach = evaluation.get("optimized_approach", "")
 
-        weak_areas.extend(low)
-        weak_areas.extend(weaknesses)
-        strong_areas.extend(high)
+        # Ask LLM to extract concepts this question tests
+        prompt = f"""
+You are analyzing a coding interview question to identify the core concepts it tests.
 
-        per_question_summary.append({
-            "question": question,
-            "type": q_type,
-            "is_optimized": is_optimized,
-            "low_scores": low,
+Question:
+{question[:500]}
+
+Candidate weakness feedback:
+{chr(10).join(weaknesses[:3])}
+
+List the 2-4 core CS concepts this question primarily tests.
+Examples: stack, dynamic programming, two pointers, binary search,
+graph traversal, recursion, hash map, sliding window, tree traversal,
+string manipulation, greedy algorithm, backtracking
+
+Return ONLY valid JSON. No explanation.
+
+{{
+  "concepts": ["concept1", "concept2"]
+}}
+"""
+        try:
+            raw = llm(prompt, model="llama3.3-70b")
+            parsed = safe_json_parse(raw)
+            concepts = parsed.get("concepts", []) if parsed else []
+        except Exception:
+            concepts = []
+
+        # Determine if user passed or failed this question
+        passed = correctness >= 7
+        completely_wrong = correctness == 0
+
+        question_concepts.append({
+            "question": question[:80],
+            "concepts": [c.lower().strip() for c in concepts],
+            "correctness": correctness,
+            "passed": passed,
+            "completely_wrong": completely_wrong,
             "weaknesses": weaknesses
         })
 
-    weak_areas = list(set(weak_areas))
-    strong_areas = list(set(strong_areas))
+    return question_concepts
 
-    # --- JD requirements summary ---
-    jd_tech = []
-    jd_systems = []
-    jd_behavioral = []
-    if isinstance(jd_requirements, dict):
-        jd_tech = jd_requirements.get("technical_skills", [])
-        jd_systems = jd_requirements.get("system_topics", [])
-        jd_behavioral = jd_requirements.get("behavioral_traits", [])
+def _geval_gap_scoring(
+    eval_results: list,
+    role: str,
+    company: str,
+    jd_requirements: dict
+) -> list:
+    """
+    Score each gap using G-Eval style + concept-level analysis.
+
+    Two layers:
+    1. Score-key gaps — correctness, time_complexity etc averaged per question type
+    2. Concept gaps — cross-question concept analysis with critical/medium/light rules:
+       - Concept wrong in 2+ questions → CRITICAL
+       - Concept wrong in 1 question, correct in another → MEDIUM
+       - Concept wrong in 1 question, never tested again → MEDIUM
+       - Minor mistake (score 1-6, not 0) → LIGHT
+    """
+    # ── LAYER 1: Score-key gaps ───────────────────────────────────
+    topic_scores = {}
+    for r in eval_results:
+        evaluation = r.get("evaluation", {})
+        q_type = evaluation.get("question_type", "coding")
+        if q_type == "behavioral":
+            continue
+        scores = evaluation.get("scores", {})
+        for k, v in scores.items():
+            if q_type == "system_design":
+                topic = f"system design — {k.replace('_', ' ').lower()}"
+            else:
+                topic = k.replace("_", " ").lower()
+            if topic not in topic_scores:
+                topic_scores[topic] = []
+            topic_scores[topic].append(v or 0)
+
+    avg_scores = {
+        topic: round(sum(vals) / len(vals), 1)
+        for topic, vals in topic_scores.items()
+    }
+
+    # Only score-key gaps below 7
+    score_key_gaps = {k: v for k, v in avg_scores.items() if v < 7}
+
+    # ── LAYER 2: Concept-level gaps ───────────────────────────────
+    question_concepts = _extract_concepts_per_question(eval_results)
+
+    # Map concept → list of (passed, completely_wrong) across questions
+    concept_results = {}
+    for qc in question_concepts:
+        for concept in qc["concepts"]:
+            if concept not in concept_results:
+                concept_results[concept] = []
+            concept_results[concept].append({
+                "passed":           qc["passed"],
+                "completely_wrong": qc["completely_wrong"],
+                "correctness":      qc["correctness"]
+            })
+
+    # Determine gap level per concept
+    concept_gaps = {}
+    for concept, results in concept_results.items():
+        failed = [r for r in results if not r["passed"]]
+        passed = [r for r in results if r["passed"]]
+        completely_wrong = [r for r in results if r["completely_wrong"]]
+
+        if not failed:
+            continue  # No gap for this concept
+
+        if len(completely_wrong) >= 2:
+            # Wrong in 2+ questions → CRITICAL
+            level = "critical"
+        elif len(completely_wrong) == 1 and len(passed) == 0:
+            # Completely wrong in 1 question, never demonstrated correctly → MEDIUM
+            level = "medium"
+        elif len(completely_wrong) == 1 and len(passed) > 0:
+            # Completely wrong in 1 but correct in another → MEDIUM
+            # (showed partial understanding)
+            level = "medium"
+        elif len(failed) >= 2:
+            # Partial failures in 2+ questions → MEDIUM
+            level = "medium"
+        else:
+            # Minor failure in 1 question → LIGHT
+            level = "light"
+
+        avg_correctness = round(
+            sum(r["correctness"] for r in results) / len(results), 1
+        )
+        concept_gaps[concept] = {
+            "avg_score":  avg_correctness,
+            "level":      level,
+            "times_failed":   len(failed),
+            "times_passed":   len(passed),
+            "times_zero":     len(completely_wrong)
+        }
+
+    # ── COMBINE both layers ───────────────────────────────────────
+    # Ask LLM to score importance of all gaps
+    all_gap_topics = list(score_key_gaps.keys()) + list(concept_gaps.keys())
+    all_gap_topics = list(set(all_gap_topics))  # deduplicate
+
+    if not all_gap_topics:
+        return []
+
+    tech     = ", ".join(jd_requirements.get("technical_skills", []))
+    systems  = ", ".join(jd_requirements.get("system_topics", []))
+    priority = ", ".join(jd_requirements.get("priority_requirements", []))
+
+    gaps_text = "\n".join(f"- {t}" for t in all_gap_topics)
 
     prompt = f"""
-You are an expert technical career coach helping a candidate prepare for a {role} role at {company}.
+You are evaluating skill gaps for a {role} interview at {company}.
 
----
+Job requires: {tech}, {systems}
+Priority requirements: {priority}
 
-JOB DESCRIPTION:
-{job_description or "Not provided"}
+Identified gaps:
+{gaps_text}
 
----
+For each gap, score its IMPORTANCE for this specific role from 0.0 to 1.0.
+0.0 = not important for this role
+1.0 = critical for this role
 
-WHAT THE JOB REQUIRES:
-- Technical Skills: {jd_tech}
-- System Topics: {jd_systems}
-- Behavioral Traits: {jd_behavioral}
+Return ONLY valid JSON. No explanation.
 
----
-
-CANDIDATE PERFORMANCE SUMMARY:
-Strong areas (scored >= 8): {strong_areas if strong_areas else "None identified"}
-Weak areas (scored < 7 or flagged): {weak_areas if weak_areas else "None identified"}
-
-Per-question breakdown:
-{json.dumps(per_question_summary, indent=2)}
-
----
-
-Your task:
-
-SECTION 1 — GAP ANALYSIS
-- List what the job requires
-- List what the candidate demonstrated well
-- List the specific gaps (things required by JD that the candidate is weak in)
-- Be specific and honest
-
-SECTION 2 — PERSONALIZED LEARNING PLAN (14 days)
-- Cover ONLY the gaps identified
-- Each day must be specific: exact topic, why it matters for this role, and a concrete practice task
-- Prioritize by importance to the role
-- Mix coding, system design, and concepts as needed
-
-Format EXACTLY as:
-
-## Gap Analysis
-
-### What This Role Requires
-- ...
-
-### What You Demonstrated Well
-- ...
-
-### Your Gaps
-- ...
-
-## 14-Day Learning Plan
-
-### Day 1 — <Topic>
-- **Why it matters:** ...
-- **Focus:** ...
-- **Practice:** ...
-
-### Day 2 — <Topic>
-...
-
-Return plain text with markdown formatting only. No JSON.
+{{
+  "importance_scores": {{
+    "gap_topic": 0.0
+  }}
+}}
 """
+    try:
+        raw = llm(prompt, model="llama3.3-70b")
+        parsed = safe_json_parse(raw)
+        importance_scores = parsed.get("importance_scores", {}) if parsed else {}
+    except Exception:
+        importance_scores = {}
 
-    response = llm(prompt)
+    scored_gaps = []
+    seen_topics = set()
 
-    if isinstance(response, str):
-        response = response.strip()
-        if response.startswith('"') and response.endswith('"'):
-            try:
-                response = json.loads(response)
-            except Exception:
-                pass
-        response = response.replace("\\n", "\n")
+    # Process concept gaps first — they are more specific
+    for concept, data in concept_gaps.items():
+        if concept in seen_topics:
+            continue
+        seen_topics.add(concept)
 
-    return response if response else "No learning plan generated."
+        avg_score  = data["avg_score"]
+        level      = data["level"]
+        importance = float(importance_scores.get(concept, 0.5))
+        severity   = round((10 - avg_score) / 10, 2)
+        priority_score = round(severity * importance, 3)
+
+        # Enforce level minimums based on concept analysis
+        if level == "critical":
+            priority_score = max(priority_score, 0.7)
+            color = "🔴"
+        elif level == "medium":
+            priority_score = max(priority_score, 0.35)
+            color = "🟠"
+        else:
+            color = "🟡"
+
+        scored_gaps.append({
+            "topic":          concept,
+            "avg_score":      avg_score,
+            "severity":       severity,
+            "importance":     importance,
+            "priority_score": priority_score,
+            "level":          level,
+            "color":          color,
+            "source":         "concept",
+            "times_failed":   data["times_failed"],
+            "times_zero":     data["times_zero"]
+        })
+
+    # Process score-key gaps (system design etc) not already covered
+    for topic, avg_score in score_key_gaps.items():
+        if topic in seen_topics:
+            continue
+        seen_topics.add(topic)
+
+        importance     = float(importance_scores.get(topic, 0.5))
+        severity       = round((10 - avg_score) / 10, 2)
+        priority_score = round(severity * importance, 3)
+
+        if priority_score >= 0.6:
+            level = "critical"
+            color = "🔴"
+        elif priority_score >= 0.35:
+            level = "medium"
+            color = "🟠"
+        else:
+            level = "light"
+            color = "🟡"
+
+        scored_gaps.append({
+            "topic":          topic,
+            "avg_score":      avg_score,
+            "severity":       severity,
+            "importance":     importance,
+            "priority_score": priority_score,
+            "level":          level,
+            "color":          color,
+            "source":         "score_key",
+            "times_failed":   0,
+            "times_zero":     0
+        })
+
+    return sorted(scored_gaps, key=lambda x: x["priority_score"], reverse=True)
+
+
+def _build_spaced_repetition_schedule(
+    scored_gaps: list,
+    not_assessed: list,
+    role: str,
+    company: str,
+    jd_requirements: dict
+) -> list:
+    """
+    Build a 14-day spaced repetition schedule.
+    Critical gaps appear multiple times.
+    Not-assessed skills fill remaining days.
+    """
+    critical = [g for g in scored_gaps if g["level"] == "critical"]
+    medium   = [g for g in scored_gaps if g["level"] == "medium"]
+    light    = [g for g in scored_gaps if g["level"] == "light"]
+
+    # Spaced repetition slots
+    # Critical gaps: Days 1, 4, 8, 13
+    # Medium gaps:   Days 2, 6, 11
+    # Light gaps:    Days 3, 9
+    # Not assessed:  Days 5, 7, 10, 12, 14
+    schedule_template = [
+        {"day": 1,  "source": "critical", "idx": 0},
+        {"day": 2,  "source": "medium",   "idx": 0},
+        {"day": 3,  "source": "light",    "idx": 0},
+        {"day": 4,  "source": "critical", "idx": 0},  # revisit
+        {"day": 5,  "source": "not_assessed", "idx": 0},
+        {"day": 6,  "source": "medium",   "idx": 1},
+        {"day": 7,  "source": "not_assessed", "idx": 1},
+        {"day": 8,  "source": "critical", "idx": 1},  # revisit
+        {"day": 9,  "source": "light",    "idx": 1},
+        {"day": 10, "source": "not_assessed", "idx": 2},
+        {"day": 11, "source": "medium",   "idx": 2},
+        {"day": 12, "source": "not_assessed", "idx": 3},
+        {"day": 13, "source": "critical", "idx": 2},  # revisit
+        {"day": 14, "source": "not_assessed", "idx": 4},
+    ]
+
+    source_map = {
+        "critical":     critical,
+        "medium":       medium,
+        "light":        light,
+        "not_assessed": [{"topic": s, "level": "not_assessed",
+                          "color": "⚪"} for s in not_assessed]
+    }
+
+    days = []
+    for slot in schedule_template:
+        source_list = source_map[slot["source"]]
+        idx = slot["idx"] % max(len(source_list), 1) if source_list else None
+
+        if not source_list or idx is None:
+            # Fall back to any available gap
+            fallback = critical or medium or light
+            if fallback:
+                gap = fallback[slot["day"] % len(fallback)]
+            else:
+                gap = {"topic": "general review", "level": "light", "color": "🟡"}
+        else:
+            gap = source_list[idx]
+
+        is_revisit = slot["source"] == "critical" and slot["day"] > 1
+
+        days.append({
+            "day": slot["day"],
+            "topic": gap["topic"],
+            "level": gap.get("level", "light"),
+            "color": gap.get("color", "🟡"),
+            "is_revisit": is_revisit,
+            "avg_score": gap.get("avg_score", None),
+            "priority_score": gap.get("priority_score", None)
+        })
+
+    return days
+
+
+def _enrich_day_content(
+    days: list,
+    role: str,
+    company: str,
+    jd_requirements: dict
+) -> list:
+    """
+    Use LLM to add focus, why_it_matters, and practice
+    for each day in the schedule.
+    """
+    days_text = "\n".join(
+        f"Day {d['day']} — {d['topic']} "
+        f"({'revisit' if d['is_revisit'] else d['level']})"
+        for d in days
+    )
+
+    tech = ", ".join(jd_requirements.get("technical_skills", []))
+    systems = ", ".join(jd_requirements.get("system_topics", []))
+
+    prompt = f"""
+You are creating a personalized interview preparation plan for a {role} role at {company}.
+
+Job requires: {tech}, {systems}
+
+14-day schedule:
+{days_text}
+
+For each day provide:
+- why_it_matters: 1 sentence specific to {company} and {role}
+- focus: 2-3 specific concepts to study (not generic)
+- practice: 1 concrete actionable task (specific problem type, not "write an essay")
+
+Return ONLY valid JSON. No explanation.
+
+{{
+  "days": [
+    {{
+      "day": 1,
+      "why_it_matters": "",
+      "focus": "",
+      "practice": ""
+    }}
+  ]
+}}
+"""
+    try:
+        raw = llm(prompt, model="llama3.3-70b")
+        parsed = safe_json_parse(raw)
+        enriched_days = parsed.get("days", []) if parsed else []
+        enriched_map = {d["day"]: d for d in enriched_days}
+    except Exception:
+        enriched_map = {}
+
+    for d in days:
+        enriched = enriched_map.get(d["day"], {})
+        d["why_it_matters"] = enriched.get("why_it_matters", "")
+        d["focus"] = enriched.get("focus", "")
+        d["practice"] = enriched.get("practice", "")
+
+    return days
+
+
+def generate_learning_path(
+    results: list,
+    role: str,
+    company: str,
+    job_description: str = "",
+    jd_requirements: dict = None,
+    user_answers: list = None
+) -> dict:
+    """
+    Generate a structured personalized learning plan.
+    Returns a dict (not a string) for proper UI rendering.
+
+    Steps:
+    1. G-Eval gap scoring — severity × importance
+    2. Detect not-assessed JD skills (handles OR groups)
+    3. Build spaced repetition schedule
+    4. Enrich each day with specific content
+    """
+    if jd_requirements is None:
+        jd_requirements = {}
+
+    logger.info("Generating learning path with G-Eval scoring...")
+
+    # Step 1 — Score gaps
+    scored_gaps = _geval_gap_scoring(results, role, company, jd_requirements)
+    logger.info(f"Scored {len(scored_gaps)} gaps.")
+
+    # Step 2 — Detect not-assessed skills
+    not_assessed = _detect_not_assessed(jd_requirements, results, user_answers)
+    logger.info(f"Detected {len(not_assessed)} not-assessed skills.")
+
+    # Step 3 — Build spaced repetition schedule
+    days = _build_spaced_repetition_schedule(
+        scored_gaps, not_assessed, role, company, jd_requirements
+    )
+
+    # Step 4 — Enrich with specific content
+    days = _enrich_day_content(days, role, company, jd_requirements)
+
+    return {
+        "role": role,
+        "company": company,
+        "scored_gaps": scored_gaps,
+        "not_assessed": not_assessed,
+        "days": days
+    }
+
+
+# -------------------------------
+# SINGLE QUESTION EVALUATION
+# (for Quick Practice mode)
+# -------------------------------
+def evaluate_single_answer(question: str, answer: str, q_type: str) -> dict:
+    """
+    Evaluate a single answer for Quick Practice mode.
+    No ideal answer generation — lightweight and fast.
+    No session saving. No learning plan.
+    """
+    if not isinstance(answer, str) or not answer.strip():
+        return {
+            "scores": {},
+            "is_optimized": False,
+            "strengths": [],
+            "weaknesses": ["No answer provided."],
+            "optimized_approach": "",
+            "question_type": q_type
+        }
+
+    # For coding — run test cases if available
+    test_results = None
+
+    # Generate ideal answer for context
+    ideal = {
+        "ideal_answer": "",
+        "key_concepts": [],
+        "common_mistakes": []
+    }
+
+    if q_type == "coding":
+        prompt = _coding_prompt(question, answer, ideal, test_results)
+    elif q_type == "system_design":
+        prompt = _system_design_prompt(question, answer, ideal)
+    else:
+        prompt = _behavioral_prompt(question, answer, ideal)
+
+    default = _default_scores(q_type)
+
+    # Single model for quick practice — no need for consensus
+    try:
+        response = llm(prompt)
+        parsed = safe_json_parse(response)
+        if not parsed or "scores" not in parsed:
+            parsed = repair_json_with_llm(response)
+    except Exception as e:
+        logger.warning(f"evaluate_single_answer failed: {e}")
+        parsed = {}
+
+    if not isinstance(parsed, dict) or "scores" not in parsed:
+        return {
+            "scores": default,
+            "is_optimized": False,
+            "strengths": [],
+            "weaknesses": ["Could not evaluate answer. Please try again."],
+            "optimized_approach": "",
+            "question_type": q_type
+        }
+
+    scores = parsed.get("scores", {})
+    if not isinstance(scores, dict):
+        scores = {}
+
+    is_optimized = parsed.get("is_optimized", _check_optimized(q_type, scores))
+
+    return {
+        "scores": {k: scores.get(k, default[k]) for k in default},
+        "is_optimized": bool(is_optimized),
+        "strengths": parsed.get("strengths", []),
+        "weaknesses": parsed.get("weaknesses", []),
+        "optimized_approach": parsed.get("optimized_approach", ""),
+        "question_type": q_type
+    }

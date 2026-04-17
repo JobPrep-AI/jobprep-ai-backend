@@ -1,0 +1,7 @@
+{
+    "dependencies": ["."],
+    "graphs": {
+      "interview_pipeline": "./agents.py:_build_generation_graph"
+    },
+    "env": ".env"
+  }

@@ -21,3 +21,4 @@ jobprep_knowledge_graph.html
 lib/
 
 .streamlit/secrets.toml
+.langgraph_api/

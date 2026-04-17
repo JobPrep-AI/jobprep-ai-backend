@@ -16,10 +16,13 @@ import json
 import logging
 from guardrails import guardrails
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Literal
 from user_profile import load_weak_areas, save_user_session
-
 from snowflake_utils import llm
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
+from langsmith import traceable
+from langsmith.wrappers import wrap_openai
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +38,8 @@ class AgentState:
     role: str = ""
     job_description: str = ""
     user_id: str = ""
+    mode: str = "deep"
+    weak_areas: list = field(default_factory=list)
 
     # JD Analyzer outputs
     jd_requirements: dict = field(default_factory=dict)
@@ -55,6 +60,7 @@ class AgentState:
 
     # Evaluator outputs
     eval_results: list = field(default_factory=list)
+    user_answers: list = field(default_factory=list)
 
     # Learning Path outputs
     learning_plan: str = ""
@@ -68,6 +74,57 @@ class AgentState:
         self.agent_logs.append(entry)
         logger.info(entry)
 
+    def to_dict(self) -> dict:
+        """Convert to dict for LangGraph state passing."""
+        import pandas as pd
+        # Serialize top_clusters DataFrame to JSON string
+        top_clusters_serial = None
+        if self.top_clusters is not None and isinstance(self.top_clusters, pd.DataFrame):
+            # Drop embedding column — numpy arrays not serializable
+            df = self.top_clusters.copy()
+            if "embedding" in df.columns:
+                df = df.drop(columns=["embedding"])
+            top_clusters_serial = df.to_json(orient="records")
+        return {
+            "company": self.company,
+            "role": self.role,
+            "job_description": self.job_description,
+            "user_id": self.user_id,
+            "mode": self.mode,
+            "weak_areas": self.weak_areas,
+            "jd_requirements": self.jd_requirements,
+            "top_clusters": top_clusters_serial,
+            "selected_questions": self.selected_questions,
+            "missing_requirements": self.missing_requirements,
+            "interview_raw": self.interview_raw,
+            "interview_parsed": self.interview_parsed,
+            "reflection_passed": self.reflection_passed,
+            "reflection_feedback": self.reflection_feedback,
+            "reflection_attempts": self.reflection_attempts,
+            "eval_results": self.eval_results,
+            "user_answers": self.user_answers,
+            "learning_plan": self.learning_plan,
+            "errors": self.errors,
+            "agent_logs": self.agent_logs,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "AgentState":
+        """Reconstruct from LangGraph state dict."""
+        import pandas as pd
+        state = cls()
+        for key, value in d.items():
+            if not hasattr(state, key):
+                continue
+            # Deserialize top_clusters from JSON string back to DataFrame
+            if key == "top_clusters" and isinstance(value, str):
+                try:
+                    setattr(state, key, pd.read_json(value, orient="records"))
+                except Exception:
+                    setattr(state, key, None)
+            else:
+                setattr(state, key, value)
+        return state
 
 # -------------------------------
 # BASE AGENT
@@ -157,6 +214,7 @@ class UserHistoryAgent(BaseAgent):
         extra = [t for t in topics if t not in existing_tech]
         state.jd_requirements["technical_skills"] = (existing_tech + extra)[:8]
 
+        state.weak_areas = weak_areas
         state.log(self.name, "Weak areas injected into JD requirements for personalized retrieval.")
         return state
 
@@ -235,7 +293,8 @@ class QuestionGeneratorAgent(BaseAgent):
             job_description=state.job_description,
             selected_questions=state.selected_questions,
             jd_requirements=state.jd_requirements,
-            missing_requirements=state.missing_requirements
+            missing_requirements=state.missing_requirements,
+            weak_areas=state.weak_areas if state.weak_areas else None
         )
 
         interview_parsed = coerce_interview_json(interview_raw)
@@ -283,13 +342,13 @@ class ReflectionAgent(BaseAgent):
         if not result.passed:
             issues.append(f"Behavioral issue: {result.reason}")        
 
-        # Check 1 — must have 3 coding questions
-        if len(coding_questions) < 3:
-            issues.append(f"Only {len(coding_questions)} coding questions generated, need 3.")
+        # Check 1 — must have 4 coding questions
+        if len(coding_questions) < 4:
+            issues.append(f"Only {len(coding_questions)} coding questions generated, need 4.")
 
         # Check 2 — difficulties must be Easy, Medium, Hard in order
-        expected_difficulties = ["Easy", "Medium", "Hard"]
-        for i, q in enumerate(coding_questions[:3]):
+        expected_difficulties = ["Easy", "Medium", "Hard", "Hard"]
+        for i, q in enumerate(coding_questions[:4]):
             diff = q.get("difficulty", "")
             if diff != expected_difficulties[i]:
                 issues.append(
@@ -303,12 +362,15 @@ class ReflectionAgent(BaseAgent):
             if any(kw in problem for kw in bad_keywords):
                 issues.append(f"Q{i+1} appears to be a SQL/database question, not DSA.")
 
-        # Check 4 — system design must have all fields
-        sd = parsed.get("system_design", {})
-        for field in ["title", "use_case", "functional_requirements",
+        # Check 4 — system design questions must be a list with 2 items
+        sd_questions = parsed.get("system_design_questions", [])
+        if len(sd_questions) < 2:
+            issues.append(f"Only {len(sd_questions)} system design questions, need 2.")
+        for j, sd in enumerate(sd_questions[:2]):
+            for f in ["title", "use_case", "functional_requirements",
                       "non_functional_requirements", "key_discussion_points"]:
-            if not sd.get(field):
-                issues.append(f"System design missing field: {field}")
+                if not sd.get(f):
+                    issues.append(f"System design {j+1} missing field: {f}")
 
         # Check 5 — behavioral must have a question
         behavioral = parsed.get("behavioral", {})
@@ -316,12 +378,12 @@ class ReflectionAgent(BaseAgent):
             issues.append("Behavioral question is empty.")
 
         # Check 6 — each coding question must have test cases
-        for i, q in enumerate(coding_questions[:3]):
+        for i, q in enumerate(coding_questions[:4]):
             if not q.get("test_cases"):
                 issues.append(f"Q{i+1} has no test cases.")
 
         # Check 7 — each coding question must have starter_code
-        for i, q in enumerate(coding_questions[:3]):
+        for i, q in enumerate(coding_questions[:4]):
             starter = q.get("starter_code", {})
             if not isinstance(starter, dict) or not starter.get("python"):
                 issues.append(f"Q{i+1} missing starter code.")
@@ -335,53 +397,20 @@ class ReflectionAgent(BaseAgent):
     def run(self, state: AgentState) -> AgentState:
         state.log(self.name, "Reflecting on generated interview...")
 
-        from graphrag_pipeline import generate_mock_interview, coerce_interview_json
+        state.reflection_attempts += 1
+        passed, feedback = self._validate(state)
 
-        for attempt in range(self.MAX_ATTEMPTS):
-            state.reflection_attempts = attempt + 1
-            passed, feedback = self._validate(state)
+        if passed:
+            state.reflection_passed = True
+            state.reflection_feedback = feedback
+            state.log(self.name, f"Reflection passed on attempt {state.reflection_attempts}.")
+            return state
 
-            if passed:
-                state.reflection_passed = True
-                state.reflection_feedback = feedback
-                state.log(self.name, f"Reflection passed on attempt {attempt + 1}.")
-                return state
-
-            state.log(self.name, f"Attempt {attempt + 1} failed:\n{feedback}")
-            state.log(self.name, "Asking LLM to fix the issues...")
-
-            # Ask LLM to fix specific issues
-            fix_prompt = f"""
-You generated a mock interview but it has issues.
-
-Issues found:
-{feedback}
-
-Original interview JSON:
-{json.dumps(state.interview_parsed, indent=2)[:3000]}
-
-Fix ALL the issues listed above and return the corrected interview as valid JSON.
-Follow the exact same JSON structure.
-Return ONLY JSON. No explanation.
-"""
-            fixed_raw = llm(fix_prompt, model="llama3.3-70b")
-            fixed_parsed = coerce_interview_json(fixed_raw)
-
-            if isinstance(fixed_parsed, dict):
-                state.interview_raw = fixed_raw
-                state.interview_parsed = fixed_parsed
-                state.log(self.name, f"LLM applied fixes, re-validating...")
-            else:
-                state.log(self.name, "LLM fix attempt returned invalid JSON.")
-
-        # If still failing after MAX_ATTEMPTS, pass anyway with feedback
+        # Validation failed — LangGraph will route back to question_generator
         state.reflection_passed = False
         state.reflection_feedback = feedback
-        state.log(
-            self.name,
-            f"Reflection failed after {self.MAX_ATTEMPTS} attempts. "
-            f"Proceeding with best available interview."
-        )
+        state.log(self.name, f"Attempt {state.reflection_attempts} failed:\n{feedback}")
+        state.log(self.name, "LangGraph will retry via question_generator node.")
         return state
 
 
@@ -425,78 +454,220 @@ class LearningPathAgent(BaseAgent):
             role=state.role,
             company=state.company,
             job_description=job_description,
-            jd_requirements=state.jd_requirements
+            jd_requirements=state.jd_requirements,
+            user_answers=state.user_answers
         )
-
         state.log(self.name, "Learning plan generated.")
         return state
 
 
 # -------------------------------
-# PIPELINE ORCHESTRATOR
+# LANGGRAPH NODE FUNCTIONS
+# Thin wrappers around agent classes
+# -------------------------------
+_input_validator   = InputValidatorAgent()
+_jd_analyzer       = JDAnalyzerAgent()
+_user_history      = UserHistoryAgent()
+_graph_retrieval   = GraphRetrievalAgent()
+_question_gen      = QuestionGeneratorAgent()
+_reflection        = ReflectionAgent()
+_evaluator         = EvaluatorAgent()
+_learning_path     = LearningPathAgent()
+
+
+@traceable(name="InputValidator")
+def node_input_validator(state: dict) -> dict:
+    s = AgentState.from_dict(state)
+    s = _input_validator.run(s)
+    return s.to_dict()
+
+@traceable(name="JDAnalyzer")
+def node_jd_analyzer(state: dict) -> dict:
+    s = AgentState.from_dict(state)
+    s = _jd_analyzer.run(s)
+    return s.to_dict()
+
+@traceable(name="UserHistory")
+def node_user_history(state: dict) -> dict:
+    s = AgentState.from_dict(state)
+    s = _user_history.run(s)
+    return s.to_dict()
+
+@traceable(name="GraphRetrieval")
+def node_graph_retrieval(state: dict) -> dict:
+    s = AgentState.from_dict(state)
+    s = _graph_retrieval.run(s)
+    return s.to_dict()
+
+@traceable(name="QuestionGenerator")
+def node_question_generator(state: dict) -> dict:
+    s = AgentState.from_dict(state)
+    s = _question_gen.run(s)
+    return s.to_dict()
+
+@traceable(name="ReflectionAgent")
+def node_reflection(state: dict) -> dict:
+    s = AgentState.from_dict(state)
+    s = _reflection.run(s)
+    return s.to_dict()
+
+@traceable(name="Evaluator")
+def node_evaluator(state: dict, qa_pairs: list) -> dict:
+    s = AgentState.from_dict(state)
+    s = _evaluator.run(s, qa_pairs)
+    return s.to_dict()
+
+@traceable(name="LearningPath")
+def node_learning_path(state: dict) -> dict:
+    s = AgentState.from_dict(state)
+    s = _learning_path.run(s, s.job_description)
+    return s.to_dict()
+
+@traceable(name="SaveSession")
+def node_save_session(state: dict) -> dict:
+    s = AgentState.from_dict(state)
+    if s.user_id and s.eval_results:
+        try:
+            save_user_session(
+                user_id=s.user_id,
+                company=s.company,
+                role=s.role,
+                results=s.eval_results
+            )
+            s.log("Pipeline", f"Session saved for user {s.user_id}.")
+        except Exception as e:
+            s.log("Pipeline", f"Session save failed: {e}")
+    return s.to_dict()
+
+# -------------------------------
+# ROUTING FUNCTIONS
+# Conditional edges for LangGraph
+# -------------------------------
+def route_after_validation(state: dict) -> Literal["jd_analyzer", "__end__"]:
+    """Stop pipeline if input validation failed."""
+    if state.get("errors"):
+        return END
+    return "jd_analyzer"
+
+def route_after_reflection(state: dict) -> Literal["question_generator", "__end__"]:
+    """
+    If reflection failed and attempts < MAX_ATTEMPTS → retry question generation.
+    If reflection passed or max attempts reached → end generation pipeline.
+    """
+    reflection_passed   = state.get("reflection_passed", False)
+    reflection_attempts = state.get("reflection_attempts", 0)
+
+    if not reflection_passed and reflection_attempts < 2:
+        return "question_generator"
+    return END
+
+
+# -------------------------------
+# BUILD LANGGRAPH PIPELINES
+# -------------------------------
+def _build_generation_graph() -> StateGraph:
+    """Build the interview generation graph."""
+    graph = StateGraph(dict)
+
+    # Add nodes
+    graph.add_node("input_validator",    node_input_validator)
+    graph.add_node("jd_analyzer",        node_jd_analyzer)
+    graph.add_node("user_history",       node_user_history)
+    graph.add_node("graph_retrieval",    node_graph_retrieval)
+    graph.add_node("question_generator", node_question_generator)
+    graph.add_node("reflection",         node_reflection)
+
+    # Entry point
+    graph.set_entry_point("input_validator")
+
+    # Fixed edges
+    graph.add_edge("jd_analyzer",        "user_history")
+    graph.add_edge("user_history",        "graph_retrieval")
+    graph.add_edge("graph_retrieval",     "question_generator")
+    graph.add_edge("question_generator",  "reflection")
+
+    # Conditional edges
+    graph.add_conditional_edges(
+        "input_validator",
+        route_after_validation,
+        {
+            "jd_analyzer": "jd_analyzer",
+            END: END
+        }
+    )
+
+    graph.add_conditional_edges(
+        "reflection",
+        route_after_reflection,
+        {
+            "question_generator": "question_generator",
+            END: END
+        }
+    )
+
+    return graph
+
+
+# -------------------------------
+# INTERVIEW PIPELINE
+# Same interface as before —
+# streamlit_app.py needs zero changes
 # -------------------------------
 class InterviewPipeline:
     """
-    Orchestrates all agents in sequence.
-    Replaces run_graphrag_interview().
+    LangGraph-orchestrated interview pipeline.
+    Exposes same interface as previous custom pipeline.
     """
 
     def __init__(self):
-        self.input_validator = InputValidatorAgent()
-        self.jd_analyzer = JDAnalyzerAgent()
-        self.user_history = UserHistoryAgent()
-        self.graph_retrieval = GraphRetrievalAgent()
-        self.question_generator = QuestionGeneratorAgent()
-        self.reflection = ReflectionAgent()
-        self.evaluator = EvaluatorAgent()
-        self.learning_path = LearningPathAgent()
+        self.checkpointer = MemorySaver()
+        generation_graph  = _build_generation_graph()
+        self.generation_app = generation_graph.compile(
+            checkpointer=self.checkpointer
+        )
+        logger.info("LangGraph InterviewPipeline initialized.")
 
+    @traceable(name="InterviewPipeline.generate_interview")
     def generate_interview(self, company: str, role: str,
-                        job_description: str, user_id: str = "") -> AgentState:
-        state = AgentState(
+                           job_description: str, user_id: str = "",
+                           mode: str = "deep") -> AgentState:
+        """
+        Run interview generation pipeline via LangGraph.
+        Returns AgentState — same as before.
+        """
+        initial_state = AgentState(
             company=company,
             role=role,
             job_description=job_description,
-            user_id=user_id
+            user_id=user_id,
+            mode=mode
+        ).to_dict()
+
+        config = {
+            "configurable": {
+                "thread_id": f"{user_id}_{company}_{role}"
+            }
+        }
+
+        logger.info("Starting LangGraph generation pipeline...")
+        final_state = self.generation_app.invoke(
+            initial_state,
+            config=config
         )
 
-        state.log("Pipeline", "Starting interview generation pipeline...")
+        return AgentState.from_dict(final_state)
 
-        # Agent 0 — Validate inputs
-        state = self.input_validator.run(state)
-        if state.errors:
-            state.log("Pipeline", "Pipeline stopped due to input validation failure.")
-            return state
-
-        # Agent 1 — Analyze JD
-        state = self.jd_analyzer.run(state)
-
-        # Agent 2 — Load user history and inject weak areas
-        state = self.user_history.run(state)
-
-        # Agent 3 — Retrieve from Graph (now boosted by weak areas)
-        state = self.graph_retrieval.run(state)
-
-        # Agent 3 — Generate Questions
-        state = self.question_generator.run(state)
-
-        # Agent 4 — Reflect and Validate
-        state = self.reflection.run(state)
-
-        state.log("Pipeline", "Interview generation complete.")
-        return state
-
+    @traceable(name="InterviewPipeline.evaluate")
     def evaluate(self, state: AgentState, qa_pairs: list) -> AgentState:
-        """Run evaluation pipeline."""
+        """
+        Run evaluation pipeline.
+        Evaluation is sequential so runs directly without LangGraph.
+        """
         state.log("Pipeline", "Starting evaluation pipeline...")
 
-        # Agent 5 — Evaluate answers
-        state = self.evaluator.run(state, qa_pairs)
+        state = _evaluator.run(state, qa_pairs)
+        state = _learning_path.run(state, state.job_description)
 
-        # Agent 6 — Generate learning plan
-        state = self.learning_path.run(state, state.job_description)
-
-        # Save session to user profile if logged in
         if state.user_id and state.eval_results:
             try:
                 save_user_session(

@@ -10,6 +10,13 @@ from history_tracker import save_session, load_recent_sessions
 from auth import login_user, register_user, update_profile
 from user_profile import load_user_sessions, get_score_trend
 import logging
+import os
+
+# LangSmith tracing
+os.environ["LANGCHAIN_TRACING_V2"] = st.secrets.get("LANGCHAIN_TRACING_V2", "false")
+os.environ["LANGCHAIN_API_KEY"]     = st.secrets.get("LANGCHAIN_API_KEY", "")
+os.environ["LANGCHAIN_PROJECT"]     = st.secrets.get("LANGCHAIN_PROJECT", "jobprep-ai")
+os.environ["LANGCHAIN_ENDPOINT"]    = st.secrets.get("LANGCHAIN_ENDPOINT", "https://api.smith.langchain.com")
 
 pipeline = InterviewPipeline()
 
@@ -22,7 +29,7 @@ logging.basicConfig(
 st.set_page_config(page_title="JobPrep AI", layout="wide")
 
 DIFFICULTY_COLORS = {"Easy": "#00C851", "Medium": "#FF8800", "Hard": "#FF4444"}
-TOTAL_SECONDS = 75 * 60
+TOTAL_SECONDS = 120 * 60
 
 
 # -------------------------------
@@ -116,6 +123,18 @@ def render_score_trend(user_id: str, role: str, company: str):
     return fig
 
 def render_timer(start_time):
+    # Stop timer if evaluation is done
+    if st.session_state.get("evaluation_done"):
+        st.markdown(
+            f"<div style='text-align:center;padding:12px;background:#1e1e2e;"
+            f"border-radius:8px;margin-bottom:8px'>"
+            f"<span style='font-size:32px;font-weight:bold'>"
+            f"✅ Done</span><br>"
+            f"<small style='color:#888'>Interview Evaluated</small></div>",
+            unsafe_allow_html=True
+        )
+        return
+
     remaining = max(0, TOTAL_SECONDS - int(time.time() - start_time))
     mins, secs = remaining // 60, remaining % 60
 
@@ -137,7 +156,10 @@ def render_timer(start_time):
 # -------------------------------
 # SESSION STATE
 # -------------------------------
-for key in ["interview_data", "user_answers", "interview_start_time", "eval_results", "agent_state", "user"]:
+for key in ["interview_data", "user_answers", "interview_start_time",
+            "eval_results", "agent_state", "user",
+            "mode", "quick_question", "quick_answer", "quick_result",
+            "learning_plan_visible", "evaluation_done", "current_page"]:
     if key not in st.session_state:
         st.session_state[key] = None
 
@@ -193,9 +215,389 @@ def show_auth_page():
                     st.error(result["message"])
 
 
+# -------------------------------
+# QUICK PRACTICE PAGE
+# -------------------------------
+CODING_TOPICS = [
+    "Arrays & Strings",
+    "Trees & Graphs",
+    "Dynamic Programming",
+    "Stack & Queue",
+    "Linked Lists",
+    "Sorting & Searching",
+    "Math & Numbers",
+    "Hashing & Maps",
+    "Matrix & Grid",
+    "Recursion & Backtracking",
+]
+
+def show_quick_practice():
+    st.title("Quick Practice")
+    st.caption("Get comfortable with one question at a time. No timer, no pressure.")
+    st.markdown("---")
+
+    # Question type selector
+    q_type = st.radio(
+        "What do you want to practice?",
+        ["Coding", "System Design", "Behavioral"],
+        horizontal=True,
+        key="quick_q_type"
+    )
+
+    topic = None
+    if q_type == "Coding":
+        topic = st.selectbox(
+            "Select a topic",
+            CODING_TOPICS,
+            key="quick_topic"
+        )
+
+    if st.button("Generate Question", type="primary", key="quick_gen_btn"):
+        with st.spinner("Generating question..."):
+            from graphrag_pipeline import generate_single_question
+            user = st.session_state.user
+            q = generate_single_question(
+                topic=topic or q_type,
+                q_type=q_type.lower().replace(" ", "_"),
+                company=user.get("target_company", ""),
+                role=user.get("target_role", "")
+            )
+        if q:
+            st.session_state.quick_question = q
+            st.session_state.quick_answer = None
+            st.session_state.quick_result = None
+            st.rerun()
+        else:
+            st.error("Could not generate question. Please try again.")
+
+    # Display question
+    if st.session_state.quick_question:
+        q = st.session_state.quick_question
+        qt = q.get("q_type", "coding")
+
+        st.markdown("---")
+
+        if qt == "coding":
+            diff = q.get("difficulty", "Medium")
+            diff_color = DIFFICULTY_COLORS.get(diff, "#888")
+            st.markdown(
+                f'<span style="background:{diff_color};color:white;padding:2px 10px;'
+                f'border-radius:12px;font-size:13px;font-weight:600">{diff}</span>',
+                unsafe_allow_html=True
+            )
+            st.markdown(f"### {q.get('title', '')}")
+            st.write(q.get("problem_statement", ""))
+            if q.get("example_input_output"):
+                st.markdown("**Example**")
+                st.code(q.get("example_input_output"))
+            if q.get("constraints"):
+                st.caption(f"Constraints: {q.get('constraints')}")
+
+            lang = st.selectbox("Language", ["python", "java", "cpp"], key="quick_lang")
+            starter = q.get("starter_code", {}).get(lang, "")
+            if "quick_code" not in st.session_state or not st.session_state.quick_code:
+                st.session_state.quick_code = starter
+            code = st.text_area("Write your solution", height=300, key="quick_code")
+
+            run_col, submit_col = st.columns(2)
+            with run_col:
+                if st.button("▶ Run Code", key="quick_run"):
+                    res = run_code(code, lang, "")
+                    output = res.get("stdout")
+                    if output and output.strip():
+                        st.code(output)
+                    else:
+                        st.info("No output.")
+                    if res.get("stderr"):
+                        st.error(res["stderr"])
+
+            with submit_col:
+                if st.button("Submit for Review", type="primary", key="quick_submit"):
+                    if not code or not code.strip():
+                        st.warning("Write your solution first.")
+                    else:
+                        with st.spinner("Evaluating..."):
+                            from evaluation_pipeline import evaluate_single_answer
+                            result = evaluate_single_answer(
+                                question=q.get("problem_statement", ""),
+                                answer=code,
+                                q_type="coding"
+                            )
+                        st.session_state.quick_result = result
+                        st.rerun()
+
+        elif qt == "system_design":
+            st.markdown(f"### {q.get('title', 'System Design')}")
+            st.markdown("**Use Case**")
+            st.write(q.get("use_case", ""))
+            st.markdown("**Functional Requirements**")
+            for item in q.get("functional_requirements", []):
+                st.write(f"- {item}")
+            st.markdown("**Non-Functional Requirements**")
+            for item in q.get("non_functional_requirements", []):
+                st.write(f"- {item}")
+            st.markdown("**Key Discussion Points**")
+            for item in q.get("key_discussion_points", []):
+                st.write(f"- {item}")
+
+            answer = st.text_area("Your answer", height=200, key="quick_sd_answer")
+            if st.button("Submit for Review", type="primary", key="quick_sd_submit"):
+                if not answer.strip():
+                    st.warning("Write your answer first.")
+                else:
+                    with st.spinner("Evaluating..."):
+                        from evaluation_pipeline import evaluate_single_answer
+                        result = evaluate_single_answer(
+                            question=f"Design {q.get('title', '')}",
+                            answer=answer,
+                            q_type="system_design"
+                        )
+                    st.session_state.quick_result = result
+                    st.rerun()
+
+        elif qt == "behavioral":
+            st.markdown("### Behavioral Question")
+            st.write(q.get("question", ""))
+            answer = st.text_area("Your answer", height=200, key="quick_beh_answer")
+            if st.button("Submit for Review", type="primary", key="quick_beh_submit"):
+                if not answer.strip():
+                    st.warning("Write your answer first.")
+                else:
+                    with st.spinner("Evaluating..."):
+                        from evaluation_pipeline import evaluate_single_answer
+                        result = evaluate_single_answer(
+                            question=q.get("question", ""),
+                            answer=answer,
+                            q_type="behavioral"
+                        )
+                    st.session_state.quick_result = result
+                    st.rerun()
+
+        # Show result
+        if st.session_state.quick_result:
+            result = st.session_state.quick_result
+            st.markdown("---")
+            st.markdown("## Feedback")
+
+            scores = result.get("scores", {})
+            is_optimized = result.get("is_optimized", False)
+
+            cols = st.columns(len(scores))
+            for col, (k, v) in zip(cols, scores.items()):
+                col.metric(k.replace("_", " ").capitalize(), f"{v}/10")
+
+            st.markdown("---")
+
+            if is_optimized:
+                st.success("✅ Great answer!")
+            else:
+                strengths = result.get("strengths", [])
+                weaknesses = result.get("weaknesses", [])
+                approach = result.get("optimized_approach", "")
+
+                if strengths:
+                    st.markdown("### Strengths")
+                    for s in strengths:
+                        st.write("✅", s)
+                if weaknesses:
+                    st.markdown("### Weaknesses")
+                    for w in weaknesses:
+                        st.write("⚠️", w)
+                if approach:
+                    st.markdown("### Better Approach")
+                    st.info(approach)
+
+            if st.button("Try Another Question", key="quick_retry"):
+                st.session_state.quick_question = None
+                st.session_state.quick_result = None
+                st.session_state.quick_code = None
+                st.rerun()
+
+
+# -------------------------------
+# LEARNING PLAN PAGE
+# -------------------------------
+def show_learning_plan_page():
+    agent_state = st.session_state.get("agent_state")
+    plan = agent_state.learning_plan if agent_state else None
+
+    # Back button
+    if st.button("← Back to Results", key="back_to_results"):
+        st.session_state.current_page = "main"
+        st.rerun()
+
+    if not plan or not isinstance(plan, dict):
+        st.warning("Learning plan not available. Please complete an interview first.")
+        return
+
+    role    = plan.get("role", "")
+    company = plan.get("company", "")
+    scored_gaps  = plan.get("scored_gaps", [])
+    not_assessed = plan.get("not_assessed", [])
+    days         = plan.get("days", [])
+
+    # ── PAGE HEADER ──────────────────────────────────────────────
+    st.markdown(f"## 📚 Personalized Learning Plan")
+    st.markdown(f"**{role}** at **{company}** · 14-day preparation schedule")
+    st.markdown("---")
+
+    # ── GAP ANALYSIS SUMMARY ─────────────────────────────────────
+    st.markdown("### 🔍 Gap Analysis")
+
+    col1, col2, col3 = st.columns(3)
+    critical_count = sum(1 for g in scored_gaps if g["level"] == "critical")
+    medium_count   = sum(1 for g in scored_gaps if g["level"] == "medium")
+    light_count    = sum(1 for g in scored_gaps if g["level"] == "light")
+
+    col1.metric("🔴 Critical Gaps", critical_count)
+    col2.metric("🟠 Medium Gaps",   medium_count)
+    col3.metric("🟡 Light Gaps",    light_count)
+
+    st.markdown("---")
+
+    # ── SCORED GAPS TABLE ─────────────────────────────────────────
+    if scored_gaps:
+        st.markdown("#### Your Performance Gaps")
+        st.caption("Ranked by priority = severity × role importance")
+
+        for gap in scored_gaps:
+            color_map = {"critical": "#FF4444", "medium": "#FF8800", "light": "#FFC107"}
+            bg_color  = color_map.get(gap["level"], "#888")
+
+            with st.container():
+                g_col1, g_col2, g_col3, g_col4 = st.columns([3, 1, 1, 1])
+                g_col1.markdown(
+                    f"{gap['color']} **{gap['topic'].title()}**"
+                )
+                g_col2.markdown(
+                    f"<span style='color:{bg_color};font-weight:600'>"
+                    f"{gap['level'].upper()}</span>",
+                    unsafe_allow_html=True
+                )
+                g_col3.markdown(f"Score: **{gap['avg_score']}/10**")
+                g_col4.markdown(
+                    f"Priority: **{gap['priority_score']}**"
+                )
+
+    # ── NOT ASSESSED ─────────────────────────────────────────────
+    if not_assessed:
+        st.markdown("---")
+        st.markdown("#### ⚪ Not Assessed in This Interview")
+        st.caption(
+            "These JD skills were not covered in your interview. "
+            "Not penalized — included in your plan for completeness."
+        )
+        cols = st.columns(min(len(not_assessed), 4))
+        for i, skill in enumerate(not_assessed):
+            cols[i % 4].markdown(
+                f"<div style='background:#2d2d2d;border-radius:8px;"
+                f"padding:6px 12px;margin:4px;text-align:center;"
+                f"font-size:13px;color:#ccc'>{skill}</div>",
+                unsafe_allow_html=True
+            )
+
+    # ── SPACED REPETITION EXPLANATION ────────────────────────────
+    st.markdown("---")
+    st.markdown("### 📅 14-Day Schedule")
+    st.caption(
+        "Critical gaps appear on Days 1, 4, 8, 13 — spaced repetition "
+        "for maximum retention. Medium gaps on Days 2, 6, 11. "
+        "Not-assessed skills fill remaining days."
+    )
+
+    # ── DAY CARDS ────────────────────────────────────────────────
+    level_colors = {
+        "critical":     "#FF4444",
+        "medium":       "#FF8800",
+        "light":        "#FFC107",
+        "not_assessed": "#888888",
+        "general review": "#888888"
+    }
+    level_bg = {
+        "critical":     "#2d1a1a",
+        "medium":       "#2d1f0e",
+        "light":        "#2d2a0e",
+        "not_assessed": "#1e1e2e",
+        "general review": "#1e1e2e"
+    }
+
+    # Show days in groups of 7
+    week1 = [d for d in days if d["day"] <= 7]
+    week2 = [d for d in days if d["day"] > 7]
+
+    for week_label, week_days in [("Week 1", week1), ("Week 2", week2)]:
+        st.markdown(f"#### {week_label}")
+        for d in week_days:
+            level      = d.get("level", "light")
+            bar_color  = level_colors.get(level, "#888")
+            revisit_tag = " 🔄 Revisit" if d.get("is_revisit") else ""
+            score_tag   = f" · scored {d['avg_score']}/10" if d.get("avg_score") else ""
+
+            with st.expander(
+                f"Day {d['day']} — {d['topic'].title()}{revisit_tag}{score_tag}",
+                expanded=False
+            ):
+                # Colored top bar
+                st.markdown(
+                    f"<div style='height:4px;background:{bar_color};"
+                    f"border-radius:2px;margin-bottom:12px'></div>",
+                    unsafe_allow_html=True
+                )
+
+                c1, c2, c3 = st.columns(3)
+
+                with c1:
+                    st.markdown("**🎯 Why It Matters**")
+                    st.caption(
+                        d.get("why_it_matters") or
+                        f"Important for {role} at {company}."
+                    )
+
+                with c2:
+                    st.markdown("**📖 Focus**")
+                    st.caption(
+                        d.get("focus") or
+                        f"Study {d['topic']} concepts."
+                    )
+
+                with c3:
+                    st.markdown("**✍️ Practice**")
+                    st.caption(
+                        d.get("practice") or
+                        f"Practice {d['topic']} problems."
+                    )
+
+                # Priority badge for non-not-assessed
+                if d.get("priority_score"):
+                    st.markdown(
+                        f"<div style='text-align:right'>"
+                        f"<span style='background:{bar_color}20;"
+                        f"color:{bar_color};border:1px solid {bar_color};"
+                        f"border-radius:12px;padding:2px 10px;"
+                        f"font-size:11px;font-weight:600'>"
+                        f"{level.upper()} · priority {d['priority_score']}"
+                        f"</span></div>",
+                        unsafe_allow_html=True
+                    )
+
+        st.markdown("---")
+
+    # ── FOOTER ───────────────────────────────────────────────────
+    st.success(
+        f"Complete this 14-day plan to significantly improve your "
+        f"{role} interview performance at {company}. "
+        f"Focus on critical gaps first — they have the highest impact."
+    )
+
+
 # Gate: show login page if not logged in
 if not st.session_state.user:
     show_auth_page()
+    st.stop()
+
+# Page routing
+if st.session_state.current_page == "learning_plan":
+    show_learning_plan_page()
     st.stop()
 
 # -------------------------------
@@ -250,6 +652,24 @@ with st.sidebar:
 # -------------------------------
 st.title("JobPrep AI — Mock Interview Generator")
 
+# Mode selector
+mode = st.radio(
+    "Select Mode",
+    ["Quick Practice", "Deep Interview"],
+    horizontal=True,
+    key="selected_mode"
+)
+st.session_state.mode = mode
+st.markdown("---")
+
+# Quick Practice — separate flow
+if mode == "Quick Practice":
+    show_quick_practice()
+    st.stop()
+
+# Deep Interview — full flow below
+st.caption("4 coding questions + 2 system design + 1 behavioral · 120 minutes · Personalized")
+
 user = st.session_state.user
 default_company = user.get("target_company") or "Google"
 default_role    = user.get("target_role")    or "Software Engineer"
@@ -267,7 +687,8 @@ if st.button("Generate Mock Interview", type="primary"):
         with st.spinner("Generating your interview..."):
             state = pipeline.generate_interview(
                 company, role, job_description,
-                user_id=st.session_state.user["user_id"]
+                user_id=st.session_state.user["user_id"],
+                mode="deep"
             )
 
         # Check if pipeline was stopped by guardrail
@@ -465,30 +886,39 @@ if st.session_state.interview_data:
             })
 
     # ----------------------------
-    # SYSTEM DESIGN
+    # SYSTEM DESIGN (2 questions)
     # ----------------------------
     st.markdown("## System Design")
-    sd = parsed.get("system_design", {})
-    sd_title = sd.get("title", "No title")
-    st.markdown(f"### {sd_title}")
+    sd_questions = parsed.get("system_design_questions", [])
 
-    st.markdown("**Use Case**")
-    st.write(sd.get("use_case", "Not provided"))
+    for sd_i, sd in enumerate(sd_questions, start=1):
+        sd_title = sd.get("title", f"System Design {sd_i}")
+        st.markdown(f"### SD{sd_i}: {sd_title}")
 
-    st.markdown("**Functional Requirements**")
-    for item in sd.get("functional_requirements", []):
-        st.write(f"- {item}")
+        st.markdown("**Use Case**")
+        st.write(sd.get("use_case", "Not provided"))
 
-    st.markdown("**Non-Functional Requirements**")
-    for item in sd.get("non_functional_requirements", []):
-        st.write(f"- {item}")
+        st.markdown("**Functional Requirements**")
+        for item in sd.get("functional_requirements", []):
+            st.write(f"- {item}")
 
-    st.markdown("**Key Discussion Points**")
-    for item in sd.get("key_discussion_points", []):
-        st.write(f"- {item}")
+        st.markdown("**Non-Functional Requirements**")
+        for item in sd.get("non_functional_requirements", []):
+            st.write(f"- {item}")
 
-    sd_answer = st.text_area("Your System Design Answer", key="sd_answer")
-    user_answers.append({"question": f"Design a {sd_title}", "answer": sd_answer or ""})
+        st.markdown("**Key Discussion Points**")
+        for item in sd.get("key_discussion_points", []):
+            st.write(f"- {item}")
+
+        sd_answer = st.text_area(
+            f"Your Answer for SD{sd_i}",
+            key=f"sd_answer_{sd_i}"
+        )
+        user_answers.append({
+            "question": f"Design a {sd_title}",
+            "answer": sd_answer or ""
+        })
+        st.markdown("---")
 
     # ----------------------------
     # BEHAVIORAL
@@ -504,48 +934,68 @@ if st.session_state.interview_data:
     # ----------------------------
     # EVALUATE
     # ----------------------------
-    if st.button("Evaluate My Answers", type="primary"):
-        # Validate answers before evaluation
-        from guardrails import guardrails
-        invalid_answers = []
-        for idx, qa in enumerate(st.session_state.user_answers or []):
-            answer = qa.get("answer", "")
-            q_type = qa.get("lang")
-            if q_type in ["python", "java", "cpp"]:
-                result = guardrails.answer.validate_coding_answer(answer)
-            else:
-                result = guardrails.answer.validate_text_answer(answer)
-            if not result.passed:
-                invalid_answers.append(f"Q{idx+1}: {result.reason}")
+    col_eval, col_new = st.columns([2, 1])
 
-        if invalid_answers:
-            st.warning(
-                "⚠️ Some answers need attention before evaluating:\n" +
-                "\n".join(f"- {a}" for a in invalid_answers)
-            )
-        else:
-            with st.spinner("Evaluating answers using multi-agent pipeline..."):
-                agent_state = st.session_state.get("agent_state")
-                if agent_state:
-                    agent_state = pipeline.evaluate(agent_state, st.session_state.user_answers)
-                    st.session_state.agent_state = agent_state
-                    results = agent_state.eval_results
+    with col_eval:
+        if not st.session_state.evaluation_done:
+            if st.button("Evaluate My Answers", type="primary"):
+                from guardrails import guardrails
+                invalid_answers = []
+                for idx, qa in enumerate(st.session_state.user_answers or []):
+                    answer = qa.get("answer", "")
+                    q_type = qa.get("lang")
+                    if q_type in ["python", "java", "cpp"]:
+                        result = guardrails.answer.validate_coding_answer(answer)
+                    else:
+                        result = guardrails.answer.validate_text_answer(answer)
+                    if not result.passed:
+                        invalid_answers.append(f"Q{idx+1}: {result.reason}")
+
+                if invalid_answers:
+                    st.warning(
+                        "⚠️ Some answers need attention before evaluating:\n" +
+                        "\n".join(f"- {a}" for a in invalid_answers)
+                    )
                 else:
-                    from evaluation_pipeline import evaluate_interview
-                    results = evaluate_interview(company, role, st.session_state.user_answers)
+                    with st.spinner("Evaluating answers using multi-agent pipeline..."):
+                        agent_state = st.session_state.get("agent_state")
+                        if agent_state:
+                            agent_state.user_answers = st.session_state.user_answers or []
+                            agent_state = pipeline.evaluate(agent_state, st.session_state.user_answers)
+                            st.session_state.agent_state = agent_state
+                            results = agent_state.eval_results
+                        else:
+                            from evaluation_pipeline import evaluate_interview
+                            results = evaluate_interview(company, role, st.session_state.user_answers)
 
-            st.session_state.eval_results = results
+                    st.session_state.eval_results = results
+                    st.session_state.evaluation_done = True
+                    st.session_state.learning_plan_visible = False
 
-            # Show evaluation agent logs
-            if agent_state:
-                with st.expander("🤖 Evaluation Agent Logs", expanded=False):
-                    for log in agent_state.agent_logs:
-                        st.caption(log)
+                    if agent_state:
+                        with st.expander("🤖 Evaluation Agent Logs", expanded=False):
+                            for log in agent_state.agent_logs:
+                                st.caption(log)
 
-            try:
-                save_session(company, role, results)
-            except Exception as e:
-                st.warning(f"Could not save session history: {e}")
+                    try:
+                        save_session(company, role, results)
+                    except Exception as e:
+                        st.warning(f"Could not save session history: {e}")
+
+                    st.rerun()
+
+    with col_new:
+        if st.button("🔄 New Attempt", key="new_attempt_btn"):
+            for key in ["interview_data", "user_answers", "interview_start_time",
+                        "eval_results", "agent_state", "evaluation_done",
+                        "learning_plan_visible", "current_page"]:
+                st.session_state[key] = None
+            for k in list(st.session_state.keys()):
+                if k.startswith("hints_") or k.startswith("code_") or \
+                   k.startswith("lang_") or k.startswith("stdin_") or \
+                   k.startswith("sd_answer") or k in ["beh_answer"]:
+                    del st.session_state[k]
+            st.rerun()
 
     # ----------------------------
     # SHOW RESULTS
@@ -617,25 +1067,14 @@ if st.session_state.interview_data:
         # ----------------------------
         # LEARNING PLAN
         # ----------------------------
-        st.markdown("## Personalized Learning Plan")
+        st.markdown("---")
 
-        agent_state = st.session_state.get("agent_state")
-        plan = agent_state.learning_plan if agent_state and agent_state.learning_plan else ""
-
-        if not plan or not isinstance(plan, str) or not plan.strip():
-            st.warning("Learning plan could not be generated. Please try evaluating again.")
-        else:
-            plan = plan.strip()
-            if plan.startswith('"') and plan.endswith('"'):
-                try:
-                    plan = json.loads(plan)
-                except Exception:
-                    pass
-            if isinstance(plan, str):
-                plan = plan.replace("\\n", "\n")
-                st.markdown(plan)
-            else:
-                st.warning("Learning plan returned unexpected format.")
+        lp_col, _ = st.columns([2, 2])
+        with lp_col:
+            if st.button("📚 View Personalized Learning Plan",
+                         type="secondary", key="show_lp_btn"):
+                st.session_state.current_page = "learning_plan"
+                st.rerun()
         
         # ----------------------------
         # SESSION COMPARISON
