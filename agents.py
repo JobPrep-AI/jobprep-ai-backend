@@ -119,7 +119,8 @@ class AgentState:
             # Deserialize top_clusters from JSON string back to DataFrame
             if key == "top_clusters" and isinstance(value, str):
                 try:
-                    setattr(state, key, pd.read_json(value, orient="records"))
+                    import io
+                    setattr(state, key, pd.read_json(io.StringIO(value), orient="records"))
                 except Exception:
                     setattr(state, key, None)
             else:

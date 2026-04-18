@@ -125,31 +125,92 @@ def strip_hardcoded_calls(code: str, lang: str) -> str:
 
 def inject_stdin_runner(code: str, lang: str) -> str:
     if lang == "python":
+        # If code already has stdin input handling — skip injection
+        if "_sys.stdin" in code or "sys.stdin" in code or \
+           "_raw = " in code or "stdin.read" in code:
+            return code
+
         fn_name = None
         for line in code.splitlines():
             m = re.match(r"^def\s+(\w+)\s*\(", line)
             if m:
                 fn_name = m.group(1)
         if fn_name:
-            return code + f"""
+            injected = '''
 
 # --- injected by validator ---
 import sys as _sys, ast as _ast
 _raw = _sys.stdin.read().strip()
 if _raw:
     _called = False
+
+    # Strategy 1 — ast.literal_eval
     try:
         _parsed = _ast.literal_eval(_raw)
         if isinstance(_parsed, tuple):
-            print({fn_name}(*_parsed))
+            _result = FN_NAME(*_parsed)
         else:
-            print({fn_name}(_parsed))
+            _result = FN_NAME(_parsed)
+        print(_result)
         _called = True
     except Exception:
         pass
+
+    # Strategy 2 — split by top-level comma
+    # handles "[1,3,-1], 2" → args=[1,3,-1], 2
+    # also handles "nums = [1,3,-1], target = 2" → strips variable names
     if not _called:
-        print({fn_name}(_raw))
-"""
+        try:
+            import re as _re
+            # Strip "varname = " prefixes from each part
+            def _strip_varname(s):
+                s = s.strip()
+                # Remove "name = " prefix if present
+                m = _re.match(r'^[a-zA-Z_]\w*\s*=\s*(.+)$', s, _re.DOTALL)
+                if m:
+                    return m.group(1).strip()
+                return s
+
+            _parts = []
+            _depth = 0
+            _current = ""
+            for _ch in _raw:
+                if _ch in "([{":
+                    _depth += 1
+                    _current += _ch
+                elif _ch in ")]}":
+                    _depth -= 1
+                    _current += _ch
+                elif _ch == "," and _depth == 0:
+                    _parts.append(_current.strip())
+                    _current = ""
+                else:
+                    _current += _ch
+            if _current.strip():
+                _parts.append(_current.strip())
+            if len(_parts) > 1:
+                _parts = [_strip_varname(_p) for _p in _parts]
+                _args = [_ast.literal_eval(_p) for _p in _parts]
+                _result = FN_NAME(*_args)
+                print(_result)
+                _called = True
+            elif len(_parts) == 1:
+                _cleaned = _strip_varname(_parts[0])
+                _result = FN_NAME(_ast.literal_eval(_cleaned))
+                print(_result)
+                _called = True
+        except Exception:
+            pass
+
+    # Strategy 3 — raw string fallback
+    if not _called:
+        try:
+            print(FN_NAME(_raw))
+        except Exception:
+            pass
+'''
+            injected = injected.replace("FN_NAME", fn_name)
+            return code + injected
         return code
 
     if lang == "java":

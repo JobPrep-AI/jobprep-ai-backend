@@ -63,14 +63,16 @@ def _is_real_question(q: str) -> bool:
 _expansion_cache = {}
 
 def expand_questions(questions, company, role):
-    enriched = []
-    for q in questions:
-        if _is_real_question(q):
-            enriched.append(q)
-            continue
-        if q in _expansion_cache:
-            enriched.append(_expansion_cache[q])
-            continue
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    # Separate questions that need expansion from those that don't
+    need_expansion = []
+    for i, q in enumerate(questions):
+        if not _is_real_question(q) and q not in _expansion_cache:
+            need_expansion.append((i, q))
+
+    def expand_one(idx_q):
+        idx, q = idx_q
         prompt = f"""You are a technical interviewer at {company} for a {role} role.
 Convert this LeetCode problem title into a full interview-style question.
 Title: {q}
@@ -78,14 +80,35 @@ Return ONLY JSON.
 No explanation.
 No markdown: {{"title": "", "problem_statement": "", "example": "", "constraints": ""}}
 No markdown, no explanation."""
-        raw = llm(prompt, model="llama3.3-70b")
+        raw = llm(prompt, model="claude-haiku-4-5")
         parsed = parse_json_response(raw)
         if isinstance(parsed, dict):
             result = f"{parsed.get('title', q)}\n{parsed.get('problem_statement', '')}\nExample: {parsed.get('example', '')}\nConstraints: {parsed.get('constraints', '')}"
         else:
             result = q
         _expansion_cache[q] = result
-        enriched.append(result)
+        return idx, result
+
+    # Run all expansions in parallel
+    if need_expansion:
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {executor.submit(expand_one, item): item for item in need_expansion}
+            for future in as_completed(futures):
+                try:
+                    idx, result = future.result()
+                    _expansion_cache[questions[idx]] = result
+                except Exception:
+                    pass
+
+    # Build enriched list in original order
+    enriched = []
+    for q in questions:
+        if _is_real_question(q):
+            enriched.append(q)
+        elif q in _expansion_cache:
+            enriched.append(_expansion_cache[q])
+        else:
+            enriched.append(q)
     return enriched
 
 @st.cache_data
@@ -143,7 +166,7 @@ No explanation.
 Input:
 {text}
 """
-    repaired = llm(repair_prompt, model="llama3.3-70b")
+    repaired = llm(repair_prompt, model="mistral-large2")
 
     try:
         parsed = json.loads(repaired)
@@ -462,10 +485,20 @@ def detect_missing_requirements(jd_requirements, selected_questions, top_cluster
 
 
 def coerce_interview_json(interview_text):
+    # Handle dict passed directly
+    if isinstance(interview_text, dict):
+        return interview_text
+
     parsed = parse_interview_json(interview_text)
     if isinstance(parsed, dict):
-        return parsed
+        # Validate it has required keys
+        has_coding = bool(parsed.get("coding_questions"))
+        has_sd     = bool(parsed.get("system_design_questions"))
+        has_beh    = bool(parsed.get("behavioral", {}).get("question"))
+        if has_coding and has_sd and has_beh:
+            return parsed
 
+    # Fallback repair
     repair_prompt = f"""
 Convert the following interview content into valid JSON with EXACT keys:
 - coding_questions (list of 4 items)
@@ -486,13 +519,12 @@ Input:
     return parse_interview_json(repaired)
 
 
-def generate_mock_interview(company, role, job_description, selected_questions,
-                            jd_requirements, missing_requirements, weak_areas=None):
-    jd_requirements = normalize_jd_requirements(jd_requirements)
+def _generate_coding_questions(company, role, job_description, selected_questions,
+                                jd_requirements, missing_requirements, weak_areas=None):
+    """Generate only the 4 coding questions."""
     variety_seed = int(time.time()) % 1000
-    text = "\n".join(selected_questions)
+    text = "\n".join(selected_questions[:6])
 
-    # Build weak area instruction for personalized question targeting
     if weak_areas and len(weak_areas) > 0:
         wa_lines = []
         slots = ["Q2 Medium", "Q3 Hard", "Q4 Hard"]
@@ -500,180 +532,48 @@ def generate_mock_interview(company, role, job_description, selected_questions,
             topic = wa.get("topic", "")
             score = wa.get("avg_score", 0)
             slot = slots[i] if i < len(slots) else "Q4 Hard"
-            wa_lines.append(
-                f"- {slot} MUST target '{topic}' — user scored {score}/10 here"
-            )
+            wa_lines.append(f"- {slot} MUST target '{topic}' — user scored {score}/10 here")
         weak_area_instruction = "\n".join(wa_lines)
     else:
         weak_area_instruction = "No specific weak areas — generate a balanced interview."
 
     tech = ", ".join(jd_requirements.get("technical_skills", []))
-    systems = ", ".join(jd_requirements.get("system_topics", []))
-    behavior = ", ".join(jd_requirements.get("behavioral_traits", []))
-    priority = ", ".join(jd_requirements.get("priority_requirements", []))
     missing = ", ".join(missing_requirements)
 
     prompt = f"""
-You MUST return ONLY raw JSON.
-Do NOT include:
-- explanations
-- extra text
-- markdown
-- code blocks
+You MUST return ONLY raw JSON. No explanation. No markdown.
 
-You are acting as a real interviewer from {company} for the role of {role}.
+You are a real interviewer from {company} for the role of {role}.
 
-Job Description:
-{job_description}
+Variety seed: {variety_seed}
 
---------------------------------------------------
-
-Variety seed (use this to ensure unique questions): {variety_seed}
-Generate questions that are DIFFERENT from typical interview questions.
-Pick uncommon but valid DSA problems.
-
-STRICT RULES:
-
-1. Coding questions MUST ONLY be Data Structures & Algorithms:
-   - arrays, strings, graphs, trees, dynamic programming, recursion
-
-2. DO NOT include:
-   - SQL queries
-   - database questions
-   - backend/API questions
-
-3. If retrieved questions are not DSA, ignore them
-
-4. Ensure:
-   - 4 coding questions
-   - 2 system design question
-   - 1 behavioral question
-
-5. Test cases must have VERIFIED correct expected outputs.
-   Trace through your own algorithm manually before writing expected_output.
-   A wrong expected_output is worse than no test case.
-
---------------------------------------------------
-
-CODING QUESTIONS (4) — ORDERED BY DIFFICULTY:
+Generate EXACTLY 4 coding questions ordered by difficulty.
 
 Question 1 MUST be EASY   — arrays, strings, basic hashing
 Question 2 MUST be MEDIUM — trees, graphs, sliding window, binary search
-Question 3 MUST be HARD   — dynamic programming, advanced graphs, complex optimization
-Question 4 MUST be HARD   — different hard topic from Q3, complex optimization
+Question 3 MUST be HARD   — dynamic programming, advanced graphs
+Question 4 MUST be HARD   — different hard topic from Q3
 
 WEAK AREA TARGETING:
 {weak_area_instruction}
 
-Each MUST include:
-- title
-- difficulty  ("Easy", "Medium", or "Hard")
-- problem_statement (FULL detailed problem)
-- example_input_output
-- constraints
-- test_cases (list of {{"input": "...", "expected_output": "..."}} objects)
-- starter_code with python, java, and cpp keys
+Technical skills required: {tech}
+Missing requirements to cover: {missing}
 
-STARTER CODE RULES:
-- Function name must match the problem
-- Parameter types must be correct for each language
-- Input reading must match the test case input format exactly
-- Do NOT implement the solution — body is pass or return default only
-- Java class must always be named Solution
-- CPP must always include bits/stdc++.h
-- Python must handle input parsing and print the result
-
-VARIETY RULE:
-- Do NOT reuse questions from previous interviews
-- Each interview must have completely different problem titles and scenarios
-- For Easy: choose a different array/string pattern each time
-- For Medium: rotate between trees, graphs, sliding window, binary search
-- For Hard: rotate between DP, advanced graphs, complex optimization
-- The behavioral question must be different each time
-- The system design must use a different real-world system each time
-
-PYTHON starter_code template:
-import json
-
-def solve(param):
-    # Write your solution here
-    pass
-
-# Input handling
-try:
-    data = input().strip()
-    print(solve(data))
-except:
-    pass
-
-JAVA starter_code template:
-import java.util.*;
-
-public class Solution {{
-    public static ReturnType solve(ParamType param) {{
-        // Write your solution here
-        return defaultValue;
-    }}
-
-    public static void main(String[] args) {{
-        Scanner sc = new Scanner(System.in);
-        String input = sc.nextLine().trim();
-        System.out.println(solve(input));
-    }}
-}}
-
-CPP starter_code template:
-#include <bits/stdc++.h>
-using namespace std;
-
-ReturnType solve(ParamType param) {{
-    // Write your solution here
-    return defaultValue;
-}}
-
-int main() {{
-    string input;
-    getline(cin, input);
-    cout << solve(input) << endl;
-    return 0;
-}}
-
-DO NOT leave any field empty.
-
---------------------------------------------------
-
-SYSTEM DESIGN (2):
-
-You MUST return 2 system design questions as a list.
-SD1: A standard system design (URL shortener, notification system, etc.)
-SD2: A more complex distributed system design (ride sharing, news feed, etc.)
-
-Each MUST have:
-- title
-- use_case
-- functional_requirements
-- non_functional_requirements
-- key_discussion_points
-
---------------------------------------------------
-
-BEHAVIORAL (1):
-
-You MUST return:
-
-{{
-  "question": ""
-}}
-
---------------------------------------------------
-
-Retrieved questions:
+Retrieved questions for context:
 {text}
 
---------------------------------------------------
+RULES:
+- ONLY Data Structures & Algorithms — NO SQL, NO database questions
+- Each question must have verified correct test cases
+- Trace through the algorithm manually before writing expected_output
+- The function name in problem_statement and test_cases MUST match the function name in starter code
+- Do NOT mix problems — each question must be a single coherent problem
+- The starter code function signature MUST match the input format of the test cases exactly
+- NEVER use a function from a different problem in starter code
+- If problem asks for LIS, starter code must have lengthOfLIS() not longestValidParentheses()
 
-Return ONLY valid JSON. No explanation. No extra text.
-
+Return ONLY this JSON:
 {{
   "coding_questions": [
     {{
@@ -682,14 +582,36 @@ Return ONLY valid JSON. No explanation. No extra text.
       "problem_statement": "",
       "example_input_output": "",
       "constraints": "",
-      "test_cases": [{{"input": "", "expected_output": ""}}],
-      "starter_code": {{
-        "python": "",
-        "java": "",
-        "cpp": ""
-      }}
+      "test_cases": [{{"input": "", "expected_output": ""}}]
     }}
-  ],
+  ]
+}}
+"""
+    return llm(prompt, model="claude-haiku-4-5")
+
+
+def _generate_system_design_questions(company, role, job_description, jd_requirements):
+    """Generate only the 2 system design questions."""
+    variety_seed = int(time.time()) % 1000
+    systems = ", ".join(jd_requirements.get("system_topics", []))
+
+    prompt = f"""
+You MUST return ONLY raw JSON. No explanation. No markdown.
+
+You are a real interviewer from {company} for the role of {role}.
+
+Variety seed: {variety_seed}
+System topics required: {systems}
+
+Generate EXACTLY 2 system design questions.
+SD1: A standard system design (URL shortener, notification system, etc.)
+SD2: A more complex distributed system (ride sharing, news feed, etc.)
+
+Each MUST have: title, use_case, functional_requirements,
+non_functional_requirements, key_discussion_points
+
+Return ONLY this JSON:
+{{
   "system_design_questions": [
     {{
       "title": "",
@@ -698,13 +620,204 @@ Return ONLY valid JSON. No explanation. No extra text.
       "non_functional_requirements": [],
       "key_discussion_points": []
     }}
-  ],
+  ]
+}}
+"""
+    return llm(prompt, model="claude-haiku-4-5")
+
+
+def _generate_behavioral_question(company, role):
+    """Generate only the 1 behavioral question."""
+    variety_seed = int(time.time()) % 1000
+
+    prompt = f"""
+You MUST return ONLY raw JSON. No explanation. No markdown.
+
+You are a real interviewer from {company} for the role of {role}.
+
+Variety seed: {variety_seed}
+
+Generate EXACTLY 1 behavioral interview question.
+Must be different each time. STAR format compatible.
+
+Return ONLY this JSON:
+{{
   "behavioral": {{
     "question": ""
   }}
 }}
 """
-    return llm(prompt, model="llama3.3-70b")
+    return llm(prompt, model="claude-haiku-4-5")
+
+def generate_starter_code(title: str, problem_statement: str, language: str) -> str:
+    """
+    Generate starter code for a single question in a single language.
+    Called on demand when user opens a question.
+    """
+    prompt = f"""
+You are a technical interviewer generating starter code for a coding question.
+
+Question Title: {title}
+Problem Statement: {problem_statement[:300]}
+Language: {language}
+
+Generate starter code for {language} with input handling included.
+
+CRITICAL RULES:
+- Generate the function definition with pass/return default body only
+- Add input handling at the bottom that reads from stdin
+- Input format is comma-separated top-level values on ONE line
+  Examples:
+    Single list:     "[1,2,3]"
+    List + int:      "[2,7,11,15], 9"
+    Two strings:     "hit, cog"
+    Single int:      "5"
+- Use the EXACT input parsing pattern shown below
+- Print the result of calling the function
+
+Python pattern:
+def functionName(param1, param2):
+    pass
+
+import sys as _sys, ast as _ast, re as _re
+_raw = _sys.stdin.read().strip()
+def _strip_var(s):
+    s = s.strip()
+    m = _re.match(r'^[a-zA-Z_]\w*\s*=\s*(.+)$', s, _re.DOTALL)
+    return m.group(1).strip() if m else s
+_parts = []
+_depth = 0
+_current = ""
+for _ch in _raw:
+    if _ch in "([{{":
+        _depth += 1
+        _current += _ch
+    elif _ch in ")}}]":
+        _depth -= 1
+        _current += _ch
+    elif _ch == "," and _depth == 0:
+        _parts.append(_current.strip())
+        _current = ""
+    else:
+        _current += _ch
+if _current.strip():
+    _parts.append(_current.strip())
+if len(_parts) > 1:
+    _args = [_ast.literal_eval(_strip_var(_p)) for _p in _parts]
+    print(functionName(*_args))
+else:
+    print(functionName(_ast.literal_eval(_strip_var(_raw))))
+
+Java pattern:
+import java.util.*;
+public class Solution {{
+    public static ReturnType functionName(ParamType param) {{
+        return defaultValue;
+    }}
+    public static void main(String[] args) {{
+        Scanner sc = new Scanner(System.in);
+        String input = sc.nextLine().trim();
+        // parse input and call function
+        System.out.println(functionName(parsedInput));
+    }}
+}}
+
+C++ pattern:
+#include <bits/stdc++.h>
+using namespace std;
+ReturnType functionName(ParamType param) {{
+    return defaultValue;
+}}
+int main() {{
+    // read from cin, call function, print result
+    return 0;
+}}
+
+IMPORTANT:
+- Replace functionName with the actual function name for this problem
+- Replace param names and types with correct ones for this problem
+- The input parsing pattern must stay EXACTLY as shown for Python
+- Return ONLY the code. No explanation. No markdown. No backticks.
+"""
+    raw = llm(prompt, model="claude-haiku-4-5")
+
+    if not isinstance(raw, str):
+        return ""
+
+    raw = raw.strip()
+
+    # Strip markdown
+    raw = re.sub(r"^```[\w]*\n?", "", raw, flags=re.MULTILINE)
+    raw = re.sub(r"```$", "", raw.strip())
+    raw = re.sub(r"^'''[\w]*\n?", "", raw, flags=re.MULTILINE)
+    raw = re.sub(r"'''$", "", raw.strip())
+
+    raw = raw.strip()
+
+    return raw
+
+def generate_mock_interview(company, role, job_description, selected_questions,
+                            jd_requirements, missing_requirements, weak_areas=None):
+    """
+    Generate mock interview by running 3 parallel LLM calls:
+    - Coding questions (4)
+    - System design questions (2)
+    - Behavioral question (1)
+    Then merge results into single JSON.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    jd_requirements = normalize_jd_requirements(jd_requirements)
+
+    def get_coding():
+        return _generate_coding_questions(
+            company, role, job_description,
+            selected_questions, jd_requirements,
+            missing_requirements, weak_areas
+        )
+
+    def get_system_design():
+        return _generate_system_design_questions(
+            company, role, job_description, jd_requirements
+        )
+
+    def get_behavioral():
+        return _generate_behavioral_question(company, role)
+
+    # Run all 3 in parallel
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        coding_future    = executor.submit(get_coding)
+        sd_future        = executor.submit(get_system_design)
+        behavioral_future = executor.submit(get_behavioral)
+
+        coding_raw    = coding_future.result()
+        sd_raw        = sd_future.result()
+        behavioral_raw = behavioral_future.result()
+
+    # Parse each response
+    coding_parsed    = parse_json_response(coding_raw)    or {}
+
+    # Validate each coding question has matching function names
+    for q in coding_parsed.get("coding_questions", []):
+        title = q.get("title", "").lower()
+        for lang, code in (q.get("starter_code") or {}).items():
+            if lang == "python" and code:
+                m = re.search(r"def\s+(\w+)\s*\(", code)
+                if m:
+                    fn = m.group(1).lower()
+                    # Log mismatch for debugging
+                    logger.info(f"Q: {title[:40]} | fn: {fn}")
+    sd_parsed        = parse_json_response(sd_raw)        or {}
+    behavioral_parsed = parse_json_response(behavioral_raw) or {}
+
+    # Merge into single interview JSON
+    merged = {
+        "coding_questions":        coding_parsed.get("coding_questions", []),
+        "system_design_questions": sd_parsed.get("system_design_questions", []),
+        "behavioral":              behavioral_parsed.get("behavioral", {"question": ""})
+    }
+
+    return json.dumps(merged)
 
 
 def collect_relevant_questions(top_clusters, jobs_df, cluster_questions, company, role, max_questions=12):

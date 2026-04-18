@@ -811,18 +811,43 @@ if st.session_state.interview_data:
 
             code_key = f"code_{i}"
             lang_key = f"lang_prev_{i}"
+            starter_key = f"starter_{i}_{lang}"
+
+            # Generate starter code on demand if not already cached
+            if not starter and starter_key not in st.session_state:
+                with st.spinner(f"Loading starter code..."):
+                    from graphrag_pipeline import generate_starter_code
+                    generated_starter = generate_starter_code(
+                        title=q.get("title", ""),
+                        problem_statement=q.get("problem_statement", ""),
+                        language=lang
+                    )
+                    st.session_state[starter_key] = generated_starter
+                    starter = generated_starter
+            elif starter_key in st.session_state:
+                starter = st.session_state[starter_key]
 
             # Pre-fill when first loaded OR when language is switched
             if code_key not in st.session_state or not st.session_state[code_key]:
-                # First load — pre-fill with starter
                 if starter:
                     st.session_state[code_key] = starter
             elif st.session_state.get(lang_key) != lang:
                 # Language switched — load new starter code
-                if starter:
-                    st.session_state[code_key] = starter
+                new_starter_key = f"starter_{i}_{lang}"
+                if new_starter_key not in st.session_state:
+                    with st.spinner(f"Loading starter code for {lang}..."):
+                        from graphrag_pipeline import generate_starter_code
+                        generated_starter = generate_starter_code(
+                            title=q.get("title", ""),
+                            problem_statement=q.get("problem_statement", ""),
+                            language=lang
+                        )
+                        st.session_state[new_starter_key] = generated_starter
+                    st.session_state[code_key] = st.session_state[new_starter_key]
+                else:
+                    st.session_state[code_key] = st.session_state[new_starter_key]
 
-            # Track current language to detect switches
+            # Track current language
             st.session_state[lang_key] = lang
 
             code = st.text_area(f"Write Code Q{i}", height=300, key=code_key)
@@ -916,7 +941,7 @@ if st.session_state.interview_data:
         )
         user_answers.append({
             "question": f"Design a {sd_title}",
-            "answer": sd_answer or ""
+            "answer": str(sd_answer).strip() if sd_answer else ""
         })
         st.markdown("---")
 
@@ -927,7 +952,10 @@ if st.session_state.interview_data:
     behavioral_q = parsed.get("behavioral", {}).get("question", "")
     st.write(behavioral_q)
     beh_answer = st.text_area("Your Behavioral Answer", key="beh_answer")
-    user_answers.append({"question": behavioral_q, "answer": beh_answer or ""})
+    user_answers.append({
+        "question": behavioral_q,
+        "answer": str(beh_answer).strip() if beh_answer else ""
+    })
 
     st.session_state.user_answers = user_answers
 
@@ -955,6 +983,10 @@ if st.session_state.interview_data:
                     st.warning(
                         "⚠️ Some answers need attention before evaluating:\n" +
                         "\n".join(f"- {a}" for a in invalid_answers)
+                    )
+                    st.info(
+                        "💡 Unanswered questions will be skipped in evaluation. "
+                        "Only answered questions will be scored."
                     )
                 else:
                     with st.spinner("Evaluating answers using multi-agent pipeline..."):
@@ -993,6 +1025,7 @@ if st.session_state.interview_data:
             for k in list(st.session_state.keys()):
                 if k.startswith("hints_") or k.startswith("code_") or \
                    k.startswith("lang_") or k.startswith("stdin_") or \
+                   k.startswith("starter_") or \
                    k.startswith("sd_answer") or k in ["beh_answer"]:
                     del st.session_state[k]
             st.rerun()

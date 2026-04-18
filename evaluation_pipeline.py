@@ -91,7 +91,18 @@ def _detect_question_type(question: str) -> str:
         "design twitter", "design uber", "design netflix",
         "design youtube", "design instagram", "design whatsapp",
         "key discussion points", "non-functional requirements",
-        "scalability of", "distributed system for"
+        "scalability of", "distributed system for",
+        "design a real", "design a url", "design a chat",
+        "design a notification", "design a ride",
+        "design a payment", "design a search",
+        "design a video", "design a social",
+        "design a messaging", "design a cache",
+        "design a rate", "design a file",
+        "design a metrics", "design a monitoring",
+        "design a logging", "design a recommendation",
+        "functional requirements", "non_functional",
+        "monitoring system", "collection system",
+        "ingestion", "time-series", "microservices architecture"
     ]
     coding_signals = [
         "given an array", "given a string", "given a list",
@@ -108,6 +119,19 @@ def _detect_question_type(question: str) -> str:
     behavioral_score = sum(1 for s in behavioral_signals if s in q)
     system_score = sum(1 for s in system_design_signals if s in q)
     coding_score = sum(1 for s in coding_signals if s in q)
+
+    # Direct prefix detection — catches "Design a {title}" format
+    # stored as question in user_answers
+    if q.startswith("design a ") or q.startswith("design an "):
+        return "system_design"
+
+    # System design and behavioral take priority over coding
+    # because coding signals are too generic
+    if system_score > 0 and system_score >= coding_score:
+        return "system_design"
+
+    if behavioral_score > 0 and behavioral_score >= coding_score:
+        return "behavioral"
 
     # Pick the highest scoring type
     scores = {
@@ -290,7 +314,13 @@ Return ONLY this JSON. No explanation. No markdown.
 """
 
 
-def _default_scores(q_type):
+def _default_scores(q_type, skipped=False):
+    if skipped:
+        if q_type == "behavioral":
+            return {"relevance": 0, "clarity": 0}
+        if q_type == "system_design":
+            return {"scalability": 0, "completeness": 0, "trade_offs": 0, "clarity": 0}
+        return {"correctness": 0, "time_complexity": 0, "space_complexity": 0, "code_quality": 0}
     if q_type == "behavioral":
         return {"relevance": 5, "clarity": 5}
     if q_type == "system_design":
@@ -360,18 +390,129 @@ def evaluate_answer(question, user_answer, ideal_data, test_results=None):
 # -------------------------------
 # INTERVIEW EVALUATION
 # -------------------------------
+from langsmith import traceable
+
+@traceable(name="evaluate_interview")
 def evaluate_interview(company, role, qa_pairs):
     from code_executor import run_test_cases, reverify_with_user_code
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    # Filter out empty answers first
-    valid_pairs = [
-        qa for qa in qa_pairs
-        if isinstance(qa.get("answer", ""), str) and qa.get("answer", "").strip()
-    ]
+    def _is_meaningful_answer(qa: dict) -> bool:
+        """Check if answer has real content beyond starter code."""
+        answer = qa.get("answer", "")
+        if not isinstance(answer, str) or not answer.strip():
+            return False
+
+        stripped = answer.strip()
+
+        # Check for coding answers
+        lang = qa.get("lang", "")
+        if lang in ["python", "java", "cpp"]:
+            lines = [
+                l.strip() for l in stripped.splitlines()
+                if l.strip() and not l.strip().startswith("#")
+                and not l.strip().startswith("//")
+                and not l.strip().startswith("/*")
+            ]
+            # Only starter code patterns — no real implementation
+            starter_only_signals = [
+                lambda l: l == "pass",
+                lambda l: l == "return null;",
+                lambda l: l == "return None",
+                lambda l: l == "return 0;",
+                lambda l: l == "return {};",
+                lambda l: l == "return new int[]{};",
+                lambda l: l == "return new int[0];",
+                lambda l: l == "return false;",
+                lambda l: l == "return true;",
+                lambda l: l == "return \"\";",
+                lambda l: l == "return [];",
+                lambda l: l == "return -1;",
+            ]
+            # If every meaningful line is a starter-only signal → skip
+            # Also filter out input handling boilerplate lines
+            input_handler_signals = [
+                "_sys.stdin", "_raw =", "_parts =", "_depth =",
+                "_current =", "_ast.literal_eval", "sys.stdin",
+                "stdin.read", "for _ch in _raw", "_parts.append",
+                "import sys as _sys", "import ast as _ast",
+                "if len(_parts)", "if _current.strip()",
+                "_args = [", "print(", "Scanner sc",
+                "sc.nextLine", "cin >>", "getline(",
+            ]
+
+            meaningful_lines = [
+                l for l in lines
+                if not (
+                    l.startswith("def ") or
+                    l.startswith("public ") or
+                    l.startswith("class ") or
+                    l.startswith("import ") or
+                    l.startswith("#include") or
+                    l.startswith("using ") or
+                    any(sig(l) for sig in starter_only_signals) or
+                    any(signal in l for signal in input_handler_signals)
+                )
+            ]
+            if len(meaningful_lines) == 0:
+                return False
+
+        # For text answers (system design + behavioral)
+        else:
+            # Filter out empty, whitespace only, or placeholder answers
+            if not stripped or len(stripped) < 20:
+                return False
+            placeholder_signals = [
+                "your answer",
+                "write your answer",
+                "type your answer",
+                "enter your answer",
+                "n/a",
+                "none",
+                "skip",
+                "no answer",
+                "not answered",
+            ]
+            if any(p in stripped.lower() for p in placeholder_signals):
+                return False
+
+        return True
+
+    # Separate answered from unanswered
+    valid_pairs = []
+    skipped_pairs = []
+
+    for qa in qa_pairs:
+        if _is_meaningful_answer(qa):
+            valid_pairs.append(qa)
+        else:
+            skipped_pairs.append(qa)
+
+    # Build skipped results with 0 scores
+    skipped_results = []
+    for qa in skipped_pairs:
+        question = qa.get("question", "")
+        q_type = _detect_question_type(question)
+        skipped_results.append({
+            "question": question,
+            "evaluation": {
+                "scores": _default_scores(q_type, skipped=True),  # ← 0s not 5s
+                "is_optimized": False,
+                "strengths": [],
+                "weaknesses": ["Question not attempted."],
+                "optimized_approach": "",
+                "question_type": q_type
+            },
+            "ideal": {},
+            "test_results": None,
+            "_order": qa.get("_order", 0)
+        })
 
     if not valid_pairs:
-        return []
+        # All skipped — return skipped results with 0 scores
+        for r in skipped_results:
+            r.pop("_order", None)
+        return skipped_results
 
     def evaluate_single(qa):
         """Evaluate a single question-answer pair."""
@@ -435,7 +576,7 @@ def evaluate_interview(company, role, qa_pairs):
 
     # Run all evaluations in parallel
     # max_workers=3 to avoid overwhelming Snowflake Cortex
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    with ThreadPoolExecutor(max_workers=5) as executor:
         future_to_idx = {
             executor.submit(evaluate_single, qa): qa.get("_order", i)
             for i, qa in enumerate(valid_pairs)
@@ -456,7 +597,17 @@ def evaluate_interview(company, role, qa_pairs):
     for r in results:
         r.pop("_order", None)
 
-    return results
+    for r in skipped_results:
+        r.pop("_order", None)
+
+    # Rebuild all results in original qa_pairs order
+    all_results = results + skipped_results
+
+    # Re-sort by original question order using qa_pairs
+    question_order = {qa.get("question", ""): i for i, qa in enumerate(qa_pairs)}
+    all_results.sort(key=lambda r: question_order.get(r.get("question", ""), 999))
+
+    return all_results
 
 
 # -------------------------------
@@ -666,28 +817,26 @@ def _detect_not_assessed(
     return list(set(not_assessed))[:6]
 
 
+@traceable(name="extract_concepts")
 def _extract_concepts_per_question(eval_results: list) -> list:
     """
     For each coding question, extract the concepts it tests
     and whether the user demonstrated them correctly.
-    Returns a list of dicts per question with concepts and pass/fail.
+    Runs in parallel for speed.
     """
-    question_concepts = []
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    for r in eval_results:
+    coding_results = [
+        r for r in eval_results
+        if r.get("evaluation", {}).get("question_type", "coding") == "coding"
+    ]
+
+    def extract_one(r):
         evaluation = r.get("evaluation", {})
-        q_type = evaluation.get("question_type", "coding")
-
-        # Only process coding questions
-        if q_type != "coding":
-            continue
-
         question = r.get("question", "")
         correctness = evaluation.get("scores", {}).get("correctness", 0)
         weaknesses = evaluation.get("weaknesses", [])
-        optimized_approach = evaluation.get("optimized_approach", "")
 
-        # Ask LLM to extract concepts this question tests
         prompt = f"""
 You are analyzing a coding interview question to identify the core concepts it tests.
 
@@ -709,27 +858,33 @@ Return ONLY valid JSON. No explanation.
 }}
 """
         try:
-            raw = llm(prompt, model="llama3.3-70b")
+            raw = llm(prompt, model="claude-haiku-4-5")
             parsed = safe_json_parse(raw)
             concepts = parsed.get("concepts", []) if parsed else []
         except Exception:
             concepts = []
 
-        # Determine if user passed or failed this question
-        passed = correctness >= 7
-        completely_wrong = correctness == 0
-
-        question_concepts.append({
+        return {
             "question": question[:80],
             "concepts": [c.lower().strip() for c in concepts],
             "correctness": correctness,
-            "passed": passed,
-            "completely_wrong": completely_wrong,
+            "passed": correctness >= 7,
+            "completely_wrong": correctness == 0,
             "weaknesses": weaknesses
-        })
+        }
+
+    question_concepts = []
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(extract_one, r) for r in coding_results]
+        for future in futures:
+            try:
+                question_concepts.append(future.result())
+            except Exception:
+                pass
 
     return question_concepts
 
+@traceable(name="geval_gap_scoring")
 def _geval_gap_scoring(
     eval_results: list,
     role: str,
@@ -861,7 +1016,7 @@ Return ONLY valid JSON. No explanation.
 }}
 """
     try:
-        raw = llm(prompt, model="llama3.3-70b")
+        raw = llm(prompt, model="claude-haiku-4-5")
         parsed = safe_json_parse(raw)
         importance_scores = parsed.get("importance_scores", {}) if parsed else {}
     except Exception:
@@ -1063,7 +1218,7 @@ Return ONLY valid JSON. No explanation.
 }}
 """
     try:
-        raw = llm(prompt, model="llama3.3-70b")
+        raw = llm(prompt, model="claude-haiku-4-5")
         parsed = safe_json_parse(raw)
         enriched_days = parsed.get("days", []) if parsed else []
         enriched_map = {d["day"]: d for d in enriched_days}
@@ -1078,7 +1233,7 @@ Return ONLY valid JSON. No explanation.
 
     return days
 
-
+@traceable(name="generate_learning_path")
 def generate_learning_path(
     results: list,
     role: str,
@@ -1102,12 +1257,20 @@ def generate_learning_path(
 
     logger.info("Generating learning path with G-Eval scoring...")
 
-    # Step 1 — Score gaps
-    scored_gaps = _geval_gap_scoring(results, role, company, jd_requirements)
-    logger.info(f"Scored {len(scored_gaps)} gaps.")
+    # Run gap scoring and not-assessed detection in parallel
+    from concurrent.futures import ThreadPoolExecutor
 
-    # Step 2 — Detect not-assessed skills
-    not_assessed = _detect_not_assessed(jd_requirements, results, user_answers)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        gap_future = executor.submit(
+            _geval_gap_scoring, results, role, company, jd_requirements
+        )
+        not_assessed_future = executor.submit(
+            _detect_not_assessed, jd_requirements, results, user_answers
+        )
+        scored_gaps  = gap_future.result()
+        not_assessed = not_assessed_future.result()
+
+    logger.info(f"Scored {len(scored_gaps)} gaps.")
     logger.info(f"Detected {len(not_assessed)} not-assessed skills.")
 
     # Step 3 — Build spaced repetition schedule
